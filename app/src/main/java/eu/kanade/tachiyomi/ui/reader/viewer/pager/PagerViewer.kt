@@ -169,6 +169,13 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
         return pager
     }
 
+    override fun setShowOriginalImage(showOriginal: Boolean) {
+        eu.kanade.tachiyomi.ui.reader.viewer.EnhancementComparison.showOriginalImage = showOriginal
+        pager.children
+            .filterIsInstance<PagerPageHolder>()
+            .forEach { it.setShowOriginalImage(showOriginal) }
+    }
+
     /**
      * Returns the PagerPageHolder for the provided page
      */

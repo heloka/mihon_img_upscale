@@ -2,12 +2,18 @@ package eu.kanade.tachiyomi.util.waifu2x
 
 import android.content.Context
 import android.graphics.Bitmap
+import org.json.JSONObject
 import eu.kanade.tachiyomi.util.qnn.QualcommHtp
 import java.io.BufferedInputStream
 import java.io.File
+import java.io.FileInputStream
+import java.security.MessageDigest
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.zip.ZipInputStream
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Waifu2x image upscaler using ncnn.
@@ -17,6 +23,11 @@ object Waifu2x {
 
     const val PROCESSING_BACKEND_VULKAN = 0
     const val PROCESSING_BACKEND_QUALCOMM_NPU = 1
+    const val QUALCOMM_NPU_TEMPORARILY_DISABLED = false
+    const val INFERENCE_BACKEND_NONE = 0
+    const val INFERENCE_BACKEND_QUALCOMM_NPU = 1
+    const val INFERENCE_BACKEND_VULKAN = 2
+    const val INFERENCE_BACKEND_NCNN = 3
     const val MODEL_REAL_ESRGAN_ANIME = 2
     const val MODEL_W2XEX_PHOTO_SMALL = 9
     const val MODEL_SPAN_NOMOSUNI_PHOTO = 19
@@ -25,7 +36,13 @@ object Waifu2x {
 
     // Bump when bundled model assets change so existing installations refresh their cache.
     private const val BUNDLED_MODEL_CACHE_VERSION = "14"
-    private const val QNN_CONTEXT_CACHE_VERSION = "17"
+    private const val QNN_CONTEXT_CACHE_VERSION = "22"
+
+    // Model downloads run on the enhancement worker's critical path, so they must
+    // fail fast (unreachable hosts) and back off instead of stalling every page.
+    private const val MODEL_DOWNLOAD_CONNECT_TIMEOUT_MS = 5_000
+    private const val MODEL_DOWNLOAD_READ_TIMEOUT_MS = 20_000
+    private const val MODEL_DOWNLOAD_RETRY_COOLDOWN_MS = 10 * 60 * 1000
 
     @Volatile private var isInitialized = false
     @Volatile private var isRealCuganInitialized = false
@@ -34,6 +51,10 @@ object Waifu2x {
     @Volatile private var isWaifu2xInitialized = false
     @Volatile private var isAnime4kInitialized = false
     @Volatile private var isW2xExInitialized = false
+    @Volatile private var qnnServiceModel: ImageEnhancementNpuClient.Model? = null
+    @Volatile private var qnnServiceContext: Context? = null
+    @Volatile private var remoteInferenceBackend = INFERENCE_BACKEND_NONE
+    private val remoteProgress = AtomicLong(-1L)
 
     init {
         try {
@@ -93,6 +114,7 @@ object Waifu2x {
         val scale: Int,
         val isPro: Boolean,
         val precision: Int,
+        val npuPrecision: Int,
         val fp16Arithmetic: Boolean,
         val processingBackend: Int,
     )
@@ -108,16 +130,19 @@ object Waifu2x {
         precision: Int = 0,
         fp16Arithmetic: Boolean = false,
         processingBackend: Int = PROCESSING_BACKEND_VULKAN,
+        npuPrecision: Int = precision,
     ): Boolean {
         val effectiveNoiseLevel = if (isPro && noiseLevel !in setOf(0, 3, 4)) 3 else noiseLevel
         val model = if (isPro) 1 else 0
         val resolvedBackend = resolveProcessingBackend(processingBackend, model, scale)
-        val resolvedPrecision = resolvePrecision(precision, resolvedBackend, model, scale)
+        val resolvedPrecision = resolvePrecision(precision, PROCESSING_BACKEND_VULKAN, model, scale)
+        val resolvedNpuPrecision = resolveNpuPrecision(npuPrecision)
         val newConfig = RealCuganConfig(
             effectiveNoiseLevel,
             scale,
             isPro,
             resolvedPrecision,
+            resolvedNpuPrecision,
             fp16Arithmetic,
             resolvedBackend,
         )
@@ -134,6 +159,7 @@ object Waifu2x {
                 scale,
                 isPro,
                 resolvedPrecision,
+                resolvedNpuPrecision,
                 fp16Arithmetic,
                 resolvedBackend,
             )
@@ -173,13 +199,16 @@ object Waifu2x {
                         4 -> "conservative"
                         else -> "no-denoise"
                     }
-                    val precisionSuffix = if (currentConfig.precision == 2) "-int8" else ""
+                    val precisionSuffix = if (currentConfig.npuPrecision == 2) "-int8" else ""
                     val family = if (isPro) "pro" else "se"
                     initializeQnnIfAvailable(
                         context,
                         "realcugan-$family-x$scale-$variant$precisionSuffix",
                         padding = if (scale == 3) 14 else 18,
+                        scale = scale,
                     )
+                } else {
+                    clearQnnServiceModel()
                 }
                 lastRealCuganConfig = currentConfig
                 nativeUpdatePerformanceConfig(tileSleepMs, tileSize)
@@ -195,7 +224,7 @@ object Waifu2x {
                 android.util.Log.d(
                     "Waifu2x",
                     "Initialized Real-CUGAN: isPro=$isPro, noise=$effectiveNoiseLevel, scale=$scale, " +
-                        "tileSleepMs=$tileSleepMs, tileSize=$tileSize, precision=${currentConfig.precision}, " +
+                        "tileSleepMs=$tileSleepMs, tileSize=$tileSize, precision=${currentConfig.precision}, npuPrecision=${currentConfig.npuPrecision}, " +
                         "backend=${backendName(currentConfig.processingBackend)}",
                 )
             }
@@ -204,7 +233,7 @@ object Waifu2x {
     }
 
     // Track Real-ESRGAN config
-    private data class RealEsrganConfig(val style: Int, val scale: Int, val precision: Int, val fp16Arithmetic: Boolean, val processingBackend: Int)
+    private data class RealEsrganConfig(val style: Int, val scale: Int, val precision: Int, val npuPrecision: Int, val fp16Arithmetic: Boolean, val processingBackend: Int)
     private var lastRealEsrganConfig: RealEsrganConfig? = null
 
     fun initRealESRGAN(
@@ -216,12 +245,14 @@ object Waifu2x {
         precision: Int = 0,
         fp16Arithmetic: Boolean = false,
         processingBackend: Int = PROCESSING_BACKEND_VULKAN,
+        npuPrecision: Int = precision,
     ): Boolean = synchronized(this) {
         val isPhotoStyle = style == REAL_ESRGAN_STYLE_PHOTO
         val outputScale = if (isPhotoStyle) 2 else scale
         val resolvedBackend = resolveProcessingBackend(processingBackend, MODEL_REAL_ESRGAN_ANIME, outputScale)
-        val resolvedPrecision = resolvePrecision(precision, resolvedBackend, MODEL_REAL_ESRGAN_ANIME, outputScale)
-        val config = RealEsrganConfig(style, outputScale, resolvedPrecision, fp16Arithmetic, resolvedBackend)
+        val resolvedPrecision = resolvePrecision(precision, PROCESSING_BACKEND_VULKAN, MODEL_REAL_ESRGAN_ANIME, outputScale)
+        val resolvedNpuPrecision = resolveNpuPrecision(npuPrecision)
+        val config = RealEsrganConfig(style, outputScale, resolvedPrecision, resolvedNpuPrecision, fp16Arithmetic, resolvedBackend)
         // Force reinit if config changed
         if (lastRealEsrganConfig != config) {
             android.util.Log.d("Waifu2x", "Real-ESRGAN config changed from $lastRealEsrganConfig to $config, reinitializing...")
@@ -257,20 +288,23 @@ object Waifu2x {
                 initializeQnnIfAvailable(
                     context,
                     if (isPhotoStyle) {
-                        if (config.precision == 2) {
+                        if (config.npuPrecision == 2) {
                             "realesrgan-general-x4v3-x2-int8"
                         } else {
                             "realesrgan-general-x4v3-x2"
                         }
                     } else {
-                        if (config.precision == 2) {
+                        if (config.npuPrecision == 2) {
                             "realesrgan-animevideov3-x2-int8"
                         } else {
                             "realesrgan-animevideov3-x2"
                         }
                     },
                     padding = if (isPhotoStyle) 32 else 16,
+                    scale = outputScale,
                 )
+            } else {
+                clearQnnServiceModel()
             }
             lastRealEsrganConfig = config
             nativeUpdatePerformanceConfig(tileSleepMs, tileSize)
@@ -403,6 +437,7 @@ object Waifu2x {
         val model: Int,
         val scale: Int,
         val precision: Int,
+        val npuPrecision: Int,
         val fp16Arithmetic: Boolean,
         val processingBackend: Int,
     )
@@ -450,15 +485,17 @@ object Waifu2x {
         precision: Int = 0,
         fp16Arithmetic: Boolean = false,
         processingBackend: Int = PROCESSING_BACKEND_VULKAN,
+        npuPrecision: Int = precision,
     ): Boolean = synchronized(this) {
         val selectedModel = w2xExModelFor(model) ?: return false
         val effectiveScale = selectedModel.scale
         val modelDir = extractModelsToCache(context, selectedModel.assetPath) ?: return false
         val modelStem = selectedModel.stem
         val resolvedBackend = resolveProcessingBackend(processingBackend, model, effectiveScale)
-        val resolvedPrecision = resolvePrecision(precision, resolvedBackend, model, effectiveScale)
+        val resolvedPrecision = resolvePrecision(precision, PROCESSING_BACKEND_VULKAN, model, effectiveScale)
+        val resolvedNpuPrecision = resolveNpuPrecision(npuPrecision)
 
-        val config = W2xExConfig(model, effectiveScale, resolvedPrecision, fp16Arithmetic, resolvedBackend)
+        val config = W2xExConfig(model, effectiveScale, resolvedPrecision, resolvedNpuPrecision, fp16Arithmetic, resolvedBackend)
         if (lastW2xExConfig != config) {
             isW2xExInitialized = false
         }
@@ -485,9 +522,12 @@ object Waifu2x {
             if (config.processingBackend == PROCESSING_BACKEND_QUALCOMM_NPU && qnnModel != null) {
                 initializeQnnIfAvailable(
                     context,
-                    if (config.precision == 2) "$qnnModel-int8" else qnnModel,
+                    if (config.npuPrecision == 2) "$qnnModel-int8" else qnnModel,
                     padding = selectedModel.padding,
+                    scale = effectiveScale,
                 )
+            } else {
+                clearQnnServiceModel()
             }
             lastW2xExConfig = config
             nativeUpdatePerformanceConfig(tileSleepMs, tileSize)
@@ -548,6 +588,22 @@ object Waifu2x {
 
         processingId = id
         try {
+            val qnnModel = qnnServiceModel
+            val qnnContext = qnnServiceContext
+            if (qnnModel != null && qnnContext != null) {
+                val npuOutput = runCatching {
+                    runBlocking(Dispatchers.IO) {
+                        ImageEnhancementNpuClient.process(qnnContext, qnnModel, argbBitmap, id)
+                    }
+                }.onFailure { error ->
+                    android.util.Log.w("Waifu2x", "Isolated QNN request failed; using Vulkan", error)
+                }.getOrNull()
+                if (npuOutput != null) {
+                    remoteInferenceBackend = INFERENCE_BACKEND_QUALCOMM_NPU
+                    return npuOutput
+                }
+            }
+            remoteInferenceBackend = INFERENCE_BACKEND_NONE
             val result = nativeProcessRealCugan(argbBitmap, id)
             return if (result === argbBitmap) null else result
         } finally {
@@ -562,13 +618,13 @@ object Waifu2x {
      * Get the raw packed progress value from native code.
      * Format: [ID (upper 32 bits)] [Progress (lower 32 bits)]
      */
-    fun getProgress(): Long = nativeGetProgress()
+    fun getProgress(): Long = remoteProgress.get().takeIf { it >= 0L } ?: nativeGetProgress()
 
     /**
      * Get only the progress percentage (0-100) from the packed value.
      */
     fun getProgressPercent(): Int {
-        val packed = nativeGetProgress()
+        val packed = getProgress()
         return (packed and 0xFFFFFFFF).toInt()
     }
 
@@ -576,14 +632,24 @@ object Waifu2x {
      * Get only the processing ID from the packed value.
      */
     fun getProgressId(): Int {
-        val packed = nativeGetProgress()
+        val packed = getProgress()
         return (packed shr 32).toInt()
+    }
+
+    internal fun updateRemoteProgress(id: Int, percent: Int) {
+        if (id >= 0) remoteProgress.set((id.toLong() shl 32) or (percent.coerceIn(0, 100).toLong() and 0xFFFFFFFFL))
+    }
+
+    internal fun clearRemoteProgress(id: Int) {
+        val current = remoteProgress.get()
+        if (current >= 0L && (current shr 32).toInt() == id) remoteProgress.compareAndSet(current, -1L)
     }
 
     /**
      * Reset Real-CUGAN to allow re-initialization with new settings.
      */
     fun resetRealCugan() {
+        clearQnnServiceModel()
         isInitialized = false
         isRealCuganInitialized = false
         isRealEsrganInitialized = false
@@ -604,6 +670,7 @@ object Waifu2x {
      */
     fun abortProcessing() {
         nativeAbortProcessing()
+        ImageEnhancementNpuClient.abort(processingId)
     }
 
     fun prepareProcessing() {
@@ -623,6 +690,7 @@ object Waifu2x {
      */
     fun destroy() {
         if (isInitialized || isRealCuganInitialized || isRealEsrganInitialized || isNoseInitialized || isWaifu2xInitialized || isAnime4kInitialized || isW2xExInitialized) {
+            clearQnnServiceModel()
             nativeDestroy()
             isInitialized = false
             isRealCuganInitialized = false
@@ -705,8 +773,10 @@ object Waifu2x {
 
 
     private fun extractModelsToCache(context: Context, assetPath: String): String? {
-        return try {
-            val cacheDir = File(context.cacheDir, assetPath)
+        val cacheDir = File(context.cacheDir, assetPath)
+        val failureMarker = File(cacheDir, ".download-failed")
+        var attemptedDownload = false
+        try {
             if (!cacheDir.exists()) {
                 cacheDir.mkdirs()
             }
@@ -732,21 +802,41 @@ object Waifu2x {
             }
 
             if (!cacheDir.hasNcnnModels()) {
-                downloadReleaseModels(assetPath, cacheDir)
+                val recentlyFailed = failureMarker.isFile &&
+                    System.currentTimeMillis() - failureMarker.lastModified() < MODEL_DOWNLOAD_RETRY_COOLDOWN_MS
+                if (!recentlyFailed) {
+                    attemptedDownload = true
+                    downloadReleaseModels(assetPath, cacheDir)
+                    if (!cacheDir.hasNcnnModels()) {
+                        downloadDirectModels(assetPath, cacheDir)
+                    }
+                }
             }
 
             if (!cacheDir.hasNcnnModels()) {
-                downloadDirectModels(assetPath, cacheDir)
-            }
-
-            if (!cacheDir.hasNcnnModels()) {
+                android.util.Log.w(
+                    "Waifu2x",
+                    "Model assets unavailable for $assetPath (download failed or not bundled)",
+                )
                 return null
             }
 
-            cacheDir.absolutePath
+            failureMarker.delete()
+            return cacheDir.absolutePath
         } catch (e: Exception) {
             android.util.Log.e("Waifu2x", "Failed to prepare model assets: $assetPath", e)
-            null
+            return null
+        } finally {
+            // Record the failure (only when a download was actually attempted) so
+            // subsequent pages fail instantly instead of waiting on connect
+            // timeouts again.
+            if (attemptedDownload && !cacheDir.hasNcnnModels()) {
+                try {
+                    failureMarker.writeText(System.currentTimeMillis().toString())
+                } catch (_: Exception) {
+                    // Best effort only.
+                }
+            }
         }
     }
 
@@ -822,8 +912,8 @@ object Waifu2x {
     private fun downloadReleaseModels(assetPath: String, cacheDir: File) {
         val source = releaseSourceFor(assetPath) ?: return
         val connection = (URL(source.url).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 15_000
-            readTimeout = 60_000
+            connectTimeout = MODEL_DOWNLOAD_CONNECT_TIMEOUT_MS
+            readTimeout = MODEL_DOWNLOAD_READ_TIMEOUT_MS
             instanceFollowRedirects = true
         }
         try {
@@ -861,8 +951,8 @@ object Waifu2x {
             val tempFile = File(cacheDir, "$filename.tmp")
             val url = "${source.baseUrl}/$filename"
             val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 15_000
-                readTimeout = 120_000
+                connectTimeout = MODEL_DOWNLOAD_CONNECT_TIMEOUT_MS
+                readTimeout = MODEL_DOWNLOAD_READ_TIMEOUT_MS
                 instanceFollowRedirects = true
             }
             try {
@@ -898,16 +988,19 @@ object Waifu2x {
     fun isQualcommNpuAvailable(): Boolean = QualcommHtp.architecture() != null && isQnnRuntimeAvailable()
 
     fun isQualcommNpuModelSupported(model: Int, scale: Int): Boolean {
-        if (model == 1) return scale == 2 || scale == 3
         if (scale != 2) return false
-        return model == 0 ||
-            model == MODEL_REAL_ESRGAN_ANIME ||
-            model == MODEL_W2XEX_PHOTO_SMALL ||
-            model == MODEL_SPAN_NOMOSUNI_PHOTO
+        // SE-only NPU by user decision: only the Real-CUGAN SE family has
+        // linker-clean model libraries AND device-verified execution on this
+        // SoC (SM8845P / HTP v81). Other families crash the DSP worker at
+        // execute time (FP16 activation overflow from the official NCNN FP16
+        // weights, e.g. Real-CUGAN Pro peaks at 72M activations); they run the
+        // Vulkan fallback instead.
+        return model == 0
     }
 
     fun resolveProcessingBackend(requestedBackend: Int, model: Int, scale: Int): Int {
         return if (
+            !QUALCOMM_NPU_TEMPORARILY_DISABLED &&
             requestedBackend == PROCESSING_BACKEND_QUALCOMM_NPU &&
             isQualcommNpuModelSupported(model, scale) &&
             isQualcommNpuAvailable()
@@ -923,44 +1016,229 @@ object Waifu2x {
         if (resolveProcessingBackend(processingBackend, model, scale) != PROCESSING_BACKEND_QUALCOMM_NPU) {
             return precision
         }
-        return if (isQualcommNpuModelSupported(model, scale) && precision == 2) 2 else 0
+        return if (precision == 2) 2 else 0
     }
+
+    /** QNN supports FP16 and W8A16 assets; Vulkan fallback precision is resolved separately. */
+    fun resolveNpuPrecision(requestedPrecision: Int): Int = if (requestedPrecision == 2) 2 else 0
+
+    fun resolveVulkanFallbackPrecision(
+        requestedPrecision: Int,
+        requestedBackend: Int,
+        model: Int,
+        scale: Int,
+    ): Int {
+        val npuWasRequested = requestedBackend == PROCESSING_BACKEND_QUALCOMM_NPU &&
+            isQualcommNpuModelSupported(model, scale)
+        return if (requestedPrecision == 2 || npuWasRequested) 0 else requestedPrecision.coerceIn(0, 3)
+    }
+
+    fun resolveVulkanFallbackFp16Arithmetic(
+        requestedFp16Arithmetic: Boolean,
+        requestedBackend: Int,
+        model: Int,
+        scale: Int,
+    ): Boolean {
+        val npuWasRequested = requestedBackend == PROCESSING_BACKEND_QUALCOMM_NPU &&
+            isQualcommNpuModelSupported(model, scale)
+        return requestedFp16Arithmetic && !npuWasRequested
+    }
+    // Note: Adreno drivers on Android 16 reject the cooperative-matrix FP16
+    // shaders; that is handled natively in waifu2x.cpp (adreno_android16_driver)
+    // by disabling just that optimization, which keeps FP16 fully usable.
 
     private fun backendName(backend: Int): String {
         return if (backend == PROCESSING_BACKEND_QUALCOMM_NPU) "Qualcomm NPU" else "Vulkan"
     }
 
     fun isQnnActive(): Boolean = try {
+        nativeIsQnnInitialized() || ImageEnhancementNpuClient.isActive()
+    } catch (_: UnsatisfiedLinkError) {
+        false
+    }
+
+    /** Backend that completed the most recent native bitmap inference. */
+    fun lastInferenceBackend(): Int = try {
+        remoteInferenceBackend.takeIf { it != INFERENCE_BACKEND_NONE } ?: nativeLastInferenceBackend()
+    } catch (_: UnsatisfiedLinkError) {
+        INFERENCE_BACKEND_NONE
+    }
+
+    private fun initializeQnnIfAvailable(context: Context, modelName: String, padding: Int, scale: Int) {
+        clearQnnServiceModel()
+        val htpArchitecture = QualcommHtp.architecture(context) ?: return
+        val socModel = QualcommHtp.platformInfo(context)?.socModel?.takeIf { it >= 0 } ?: return
+        if (!isQnnRuntimeAvailable()) return
+        try {
+            // Model libraries are composed on-device. Serialized contexts also
+            // need the exact QNN SoC model; HTP generation alone is not enough.
+            val assetNames = context.assets.list("qnn-contexts")?.toSet() ?: emptySet()
+            val manifest = context.assets.open("qnn-contexts/manifest.json").bufferedReader().use { reader ->
+                JSONObject(reader.readText()).getJSONArray("models")
+            }
+            val compatibleEntries = buildMap {
+                for (index in 0 until manifest.length()) {
+                    val entry = manifest.getJSONObject(index)
+                    if (entry.optInt("htpArchitecture") != htpArchitecture) continue
+                    val asset = entry.getString("asset")
+                    val artifact = entry.optString("artifact")
+                    val targetSocModel = entry.opt("qnnSocModel")?.toString()
+                    if (!isQnnAssetSocCompatible(artifact, targetSocModel, socModel)) {
+                        android.util.Log.w(
+                            "Waifu2x",
+                            "Skipping $asset: QNN SoC target $targetSocModel does not match device SoC $socModel",
+                        )
+                        continue
+                    }
+                    put(asset, entry)
+                }
+            }
+            val manifestHashes = compatibleEntries.mapValues { it.value.getString("sha256") }
+            val manifestEligibility = compatibleEntries.mapValues { it.value.optBoolean("runtimeEligible", true) }
+            val manifestWeightSymbols = compatibleEntries.mapValues { (_, entry) ->
+                entry.optInt("unresolvedWeightSymbolCount", -1).takeIf { it >= 0 }
+            }
+            val candidates = qnnAssetCandidateNames(modelName, htpArchitecture, assetNames)
+                .filter { manifestHashes.containsKey(it) && manifestEligibility[it] != false }
+            qnnAssetCandidateNames(modelName, htpArchitecture, assetNames)
+                .filter { manifestEligibility[it] == false }
+                .forEach { rejected ->
+                    android.util.Log.w(
+                        "Waifu2x",
+                        "Skipping $rejected: model library has " +
+                            "${manifestWeightSymbols[rejected] ?: "unknown"} unlinked weight symbols",
+                    )
+                }
+            if (candidates.isEmpty()) return
+            val directory = File(context.cacheDir, "qnn-contexts-v$htpArchitecture").apply { mkdirs() }
+            for (filename in candidates) {
+                try {
+                    val output = File(directory, filename)
+                    val expectedHash = manifestHashes.getValue(filename)
+                    val cacheVersion = "$QNN_CONTEXT_CACHE_VERSION:$expectedHash"
+                    val version = File(directory, ".$filename.version")
+                    val cacheMatches = output.isFile && output.length() > 0L &&
+                        version.takeIf(File::isFile)?.readText() == cacheVersion &&
+                        output.sha256() == expectedHash
+                    if (!cacheMatches) {
+                        val partial = File(directory, "${output.name}.partial")
+                        partial.delete()
+                        try {
+                            context.assets.open("qnn-contexts/$filename").use { input ->
+                                partial.outputStream().use(input::copyTo)
+                            }
+                            check(partial.isFile && partial.length() > 0L) {
+                                "QNN asset extraction was empty: $filename"
+                            }
+                            check(partial.sha256() == expectedHash) {
+                                "QNN asset checksum mismatch: $filename"
+                            }
+                            check(partial.renameTo(output)) {
+                                "Unable to commit extracted QNN asset: $filename"
+                            }
+                            if (filename.endsWith(".model.so")) {
+                                File(output.absolutePath + ".context.bin").delete()
+                            }
+                            version.writeText(cacheVersion)
+                        } finally {
+                            partial.delete()
+                        }
+                    }
+                    val inputPadding = compatibleEntries[filename]?.optInt("tilePadding", padding) ?: padding
+                    val model = ImageEnhancementNpuClient.Model(
+                        path = output.absolutePath,
+                        nativeLibraryDir = context.applicationInfo.nativeLibraryDir,
+                        padding = inputPadding,
+                        inputBgr = compatibleEntries[filename]?.optString("inputLayout") == "NCHW_BGR",
+                        scale = scale,
+                    )
+                    qnnServiceModel = model
+                    qnnServiceContext = context.applicationContext
+                    val active = runBlocking(Dispatchers.IO) {
+                        ImageEnhancementNpuClient.initialize(context, model)
+                    }
+                    if (active) {
+                        android.util.Log.i(
+                            "Waifu2x",
+                            "Qualcomm NPU enabled: $filename (HTP v$htpArchitecture, SoC $socModel)",
+                        )
+                        return
+                    }
+                    android.util.Log.w(
+                        "Waifu2x",
+                        "QNN rejected $filename; trying the next exact-architecture artifact",
+                    )
+                } catch (e: Exception) {
+                    android.util.Log.w("Waifu2x", "Unable to use QNN artifact $filename", e)
+                }
+            }
+            android.util.Log.w(
+                "Waifu2x",
+                "No usable QNN artifact for $modelName on HTP v$htpArchitecture / SoC $socModel; using Vulkan",
+            )
+        } catch (e: Exception) {
+            android.util.Log.w("Waifu2x", "Unable to initialize Qualcomm NPU; using Vulkan", e)
+        }
+    }
+
+    private fun clearQnnServiceModel(shutdownService: Boolean = true) {
+        qnnServiceModel = null
+        qnnServiceContext = null
+        remoteInferenceBackend = INFERENCE_BACKEND_NONE
+        if (shutdownService) ImageEnhancementNpuClient.shutdown()
+    }
+
+    internal fun currentQnnModel(): ImageEnhancementNpuClient.Model? = qnnServiceModel
+
+    internal fun initializeQnnModelForService(
+        context: Context,
+        modelPath: String,
+        padding: Int,
+        inputBgr: Boolean,
+    ): Boolean = nativeInitQnn(
+        modelPath,
+        context.applicationInfo.nativeLibraryDir,
+        padding,
+        inputBgr,
+    )
+
+    internal fun isLocalQnnActive(): Boolean = try {
         nativeIsQnnInitialized()
     } catch (_: UnsatisfiedLinkError) {
         false
     }
 
-    private fun initializeQnnIfAvailable(context: Context, modelName: String, padding: Int) {
-        val htpArchitecture = QualcommHtp.architecture(context) ?: return
-        if (!isQnnRuntimeAvailable()) return
-        try {
-            val filename = "$modelName.v$htpArchitecture.bin"
-            val directory = File(context.cacheDir, "qnn-contexts-v$htpArchitecture").apply { mkdirs() }
-            val output = File(directory, filename)
-            val version = File(directory, ".$filename.version")
-            if (!output.isFile || version.takeIf(File::isFile)?.readText() != QNN_CONTEXT_CACHE_VERSION) {
-                context.assets.open("qnn-contexts/$filename").use { input ->
-                    output.outputStream().use(input::copyTo)
-                }
-                version.writeText(QNN_CONTEXT_CACHE_VERSION)
+    internal fun processQnnOnly(input: Bitmap, id: Int, scale: Int): Bitmap? = nativeProcessQnnOnly(input, id, scale)
+
+    internal fun abortQnnServiceProcessing() = nativeAbortProcessing()
+
+    internal fun shutdownQnnService() = nativeDestroy()
+
+    fun retryNpu() = ImageEnhancementNpuClient.retryLastModel()
+
+    internal fun qnnAssetCandidateNames(modelName: String, architecture: Int, assets: Set<String>): List<String> =
+        listOf("$modelName.v$architecture.model.so", "$modelName.v$architecture.bin", "$modelName.v$architecture.dlc")
+            .filter(assets::contains)
+
+    internal fun isQnnAssetSocCompatible(artifact: String, targetSocModel: String?, deviceSocModel: Int): Boolean =
+        when (artifact) {
+            "model-library" -> targetSocModel == "runtime"
+            "context" -> targetSocModel?.toIntOrNull() == deviceSocModel
+            else -> false
+        }
+
+    private fun File.sha256(): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(this).use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
             }
-            val active = nativeInitQnn(
-                output.absolutePath,
-                context.applicationInfo.nativeLibraryDir,
-                padding,
-            )
-            android.util.Log.d(
-                "Waifu2x",
-                "Qualcomm NPU ${if (active) "enabled" else "unavailable"}: $filename (HTP v$htpArchitecture)",
-            )
-        } catch (e: Exception) {
-            android.util.Log.w("Waifu2x", "Unable to initialize Qualcomm NPU; using Vulkan", e)
+        }
+        return digest.digest().joinToString("") { byte ->
+            (byte.toInt() and 0xff).toString(16).padStart(2, '0')
         }
     }
 
@@ -1004,8 +1282,28 @@ object Waifu2x {
     private external fun nativeClearAbortProcessing()
     private external fun nativeSetUiBusy(busy: Boolean)
     private external fun nativeIsQnnRuntimeAvailable(): Boolean
-    private external fun nativeInitQnn(contextPath: String, nativeLibraryDir: String, padding: Int): Boolean
+    private external fun nativeInitQnn(
+        contextPath: String,
+        nativeLibraryDir: String,
+        padding: Int,
+        inputBgr: Boolean,
+    ): Boolean
+
+    internal fun initializeQnnModelForInstrumentation(
+        context: Context,
+        modelLibraryPath: String,
+        padding: Int = 0,
+        inputBgr: Boolean = false,
+    ): Boolean = nativeInitQnn(
+        modelLibraryPath,
+        context.applicationInfo.nativeLibraryDir,
+        padding,
+        inputBgr,
+    )
+
     private external fun nativeIsQnnInitialized(): Boolean
+    private external fun nativeLastInferenceBackend(): Int
+    private external fun nativeProcessQnnOnly(input: Bitmap, id: Int, scale: Int): Bitmap?
 
     // ... (Anime4K signatures unchanged)
 

@@ -86,3 +86,4 @@
 -keep interface com.google.firebase.installations.** { *; }
 
 -dontwarn androidx.window.extensions.**
+-dontwarn androidx.concurrent.futures.SuspendToFutureAdapter

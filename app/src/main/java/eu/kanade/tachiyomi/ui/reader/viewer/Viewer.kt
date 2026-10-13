@@ -31,6 +31,8 @@ interface Viewer {
      */
     fun moveToPage(page: ReaderPage)
 
+    fun setShowOriginalImage(showOriginal: Boolean) {}
+
     /**
      * Called from the containing activity when a key [event] is received. It should return true
      * if the event was handled, false otherwise.

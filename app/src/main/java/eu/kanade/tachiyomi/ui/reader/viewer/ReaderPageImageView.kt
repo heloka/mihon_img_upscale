@@ -52,6 +52,7 @@ import eu.kanade.tachiyomi.util.system.animatorDurationScale
 import eu.kanade.tachiyomi.util.view.isVisibleOnScreen
 import eu.kanade.tachiyomi.util.waifu2x.Waifu2x
 import eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache
+import eu.kanade.tachiyomi.util.waifu2x.EnhancedPageMemoryCache
 import eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer
 import okio.Buffer
 import tachiyomi.core.common.util.system.logcat
@@ -156,9 +157,15 @@ open class ReaderPageImageView @JvmOverloads constructor(
     
     private var processingJob: Job? = null
     private var enhancedBitmap: Bitmap? = null
+    // True while the enhanced bitmap is owned by the shared memory ring; such bitmaps are
+    // never recycled by this view because other pages may still hold the same instance.
+    private var enhancedBitmapShared = false
     private var processedSwapView: SubsamplingScaleImageView? = null
     private var outgoingProcessedView: SubsamplingScaleImageView? = null
     private var processedSwapAnimator: ValueAnimator? = null
+    private var originalComparisonView: SubsamplingScaleImageView? = null
+    private var enhancedComparisonView: SubsamplingScaleImageView? = null
+    private var showOriginalComparison = false
 
     var onImageLoaded: (() -> Unit)? = null
     var onImageLoadError: ((Throwable?) -> Unit)? = null
@@ -236,8 +243,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
             enhancedOverlay.alpha = 0f
             enhancedOverlay.isVisible = false
             enhancedOverlay.setImageBitmap(null)
-            enhancedBitmap?.recycle()
-            enhancedBitmap = null
+            recycleEnhancedBitmap()
             isSettingProcessedImage = false
         }
 
@@ -253,8 +259,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
             pageView?.alpha = 1f
             enhancedOverlay.setImageBitmap(null)
             enhancedOverlay.isVisible = false
-            enhancedBitmap?.recycle()
-            enhancedBitmap = null
+            recycleEnhancedBitmap()
             isSettingProcessedImage = false
         }
     }
@@ -272,17 +277,36 @@ open class ReaderPageImageView @JvmOverloads constructor(
             enhancedOverlay.animate().cancel()
             enhancedOverlay.isVisible = false
             enhancedOverlay.setImageBitmap(null)
-            enhancedBitmap?.recycle()
-            enhancedBitmap = null
+            recycleEnhancedBitmap()
             isSettingProcessedImage = false
             pageView?.alpha = 1f
         }
     }
 
-    private fun decodeEnhancedBitmap(file: java.io.File): Bitmap? {
+
+    private fun recycleEnhancedBitmap() {
+        if (!enhancedBitmapShared) recycleEnhancedBitmap()
+        enhancedBitmapShared = false
+    }
+    private fun decodeEnhancedBitmap(file: java.io.File, ringKey: String? = null): Bitmap? {
+        if (ringKey != null) {
+            EnhancedPageMemoryCache.get(ringKey)?.let { cached ->
+                if (ImageEnhancementCache.isDisplayable(cached)) return cached
+                EnhancedPageMemoryCache.remove(ringKey)
+            }
+        }
         return try {
             val bitmap = android.graphics.BitmapFactory.decodeFile(file.absolutePath) ?: return null
             if (ImageEnhancementCache.isDisplayable(bitmap)) {
+                if (ringKey != null) {
+                    // Size the ring from the measured frame so the preload window stays resident.
+                    EnhancedPageMemoryCache.configure(
+                        context,
+                        preferences.realCuganPreloadSize().get(),
+                        bitmap.byteCount,
+                    )
+                    EnhancedPageMemoryCache.put(ringKey, bitmap)
+                }
                 bitmap
             } else {
                 android.util.Log.w("ReaderPageImageView", "Ignoring invalid enhanced cache: ${file.absolutePath}")
@@ -363,20 +387,51 @@ open class ReaderPageImageView @JvmOverloads constructor(
         val swapView = processedSwapView ?: return
         swapView.alpha = 1f
         swapView.clipBounds = null
-        pageView = swapView
-
-        outgoingProcessedView?.let { outgoingView ->
-            if (outgoingView !== swapView) {
-                outgoingView.recycle()
-                removeView(outgoingView)
+        val outgoingView = outgoingProcessedView
+        if (enhancedComparisonView != null && enhancedComparisonView !== swapView) {
+            enhancedComparisonView?.let {
+                it.recycle()
+                removeView(it)
             }
         }
+        originalComparisonView = outgoingView ?: originalComparisonView
+        enhancedComparisonView = swapView
+        swapView.isVisible = !showOriginalComparison
+        originalComparisonView?.isVisible = showOriginalComparison
+        pageView = if (showOriginalComparison) originalComparisonView ?: swapView else swapView
+        pageView?.bringToFront()
+        statusView.bringToFront()
         processedSwapView = null
         outgoingProcessedView = null
 
         if (notifyLoaded) {
             onImageLoaded()
         }
+    }
+
+    fun setShowOriginalImage(showOriginal: Boolean) {
+        showOriginalComparison = showOriginal
+        val original = originalComparisonView ?: return
+        val enhanced = enhancedComparisonView ?: return
+        val current = pageView as? SubsamplingScaleImageView ?: return
+        val target = if (showOriginal) original else enhanced
+        if (target === current || target.sWidth <= 0 || target.sHeight <= 0) return
+
+        val currentMinScale = current.minScale.takeIf { it > 0f } ?: return
+        val targetMinScale = target.minScale.takeIf { it > 0f } ?: return
+        val scaleFactor = current.scale / currentMinScale
+        val currentCenter = current.center ?: return
+        val mappedCenter = PointF(
+            currentCenter.x / current.sWidth.coerceAtLeast(1) * target.sWidth,
+            currentCenter.y / current.sHeight.coerceAtLeast(1) * target.sHeight,
+        )
+        target.setScaleAndCenter((targetMinScale * scaleFactor).coerceIn(targetMinScale, target.maxScale), mappedCenter)
+        current.isVisible = false
+        target.alpha = 1f
+        target.isVisible = true
+        target.bringToFront()
+        pageView = target
+        statusView.bringToFront()
     }
 
     private fun displayedImageRect(view: SubsamplingScaleImageView): RectF? {
@@ -534,6 +589,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
                     enhancedOverlay.isVisible = true
                     statusView.bringToFront()
                     enhancedBitmap = previewBitmap
+                    enhancedBitmapShared = false
                     isSettingProcessedImage = true
                     pageView?.alpha = 0f
                 } else {
@@ -541,8 +597,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
                     enhancedOverlay.animate().cancel()
                     enhancedOverlay.setImageBitmap(null)
                     enhancedOverlay.isVisible = false
-                    enhancedBitmap?.recycle()
-                    enhancedBitmap = null
+                    recycleEnhancedBitmap()
                     isSettingProcessedImage = false
                 }
             }
@@ -555,8 +610,13 @@ open class ReaderPageImageView @JvmOverloads constructor(
             val activeView = pageView as? SubsamplingScaleImageView
             if (activeView != null) {
                 animateProcessedSwap(activeView, config) {
-                    val uri = android.net.Uri.fromFile(file)
-                    setImageWithCurrentCrop(ImageSource.uri(context, uri))
+                    if (!bitmap.isRecycled) {
+                        // A live ring bitmap skips the tile decoder's file re-read entirely.
+                        setImageWithCurrentCrop(ImageSource.bitmap(bitmap))
+                    } else {
+                        val uri = android.net.Uri.fromFile(file)
+                        setImageWithCurrentCrop(ImageSource.uri(context, uri))
+                    }
                 }
                 currentLoadedUri = uriString
                 isVisible = true
@@ -569,6 +629,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
             enhancedOverlay.isVisible = true
             statusView.bringToFront()
             enhancedBitmap = bitmap
+            enhancedBitmapShared = true
             isSettingProcessedImage = true
             pageView?.alpha = 0f
         }
@@ -717,8 +778,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
             pageView?.alpha = 1f
             enhancedOverlay.setImageBitmap(null)
             enhancedOverlay.isVisible = false
-            enhancedBitmap?.recycle()
-            enhancedBitmap = null
+            recycleEnhancedBitmap()
             isSettingProcessedImage = false
             updateStatus(context.stringResource(MR.strings.reader_status_processing))
         }
@@ -781,7 +841,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
                                  return@launchIO
                              }
 
-                             val bitmap = decodeEnhancedBitmap(cachedFile)
+                             val bitmap = decodeEnhancedBitmap(cachedFile, EnhancedPageMemoryCache.key(mId, cId, pIdx, configHash, pageVariant))
                              
                              if (bitmap != null) {
                                  withUIContext {
@@ -885,6 +945,16 @@ open class ReaderPageImageView @JvmOverloads constructor(
 
     fun recycle() {
         clearProcessedSwapView()
+        enhancedComparisonView?.takeIf { it !== pageView }?.let {
+            it.recycle()
+            removeView(it)
+        }
+        originalComparisonView?.takeIf { it !== pageView }?.let {
+            it.recycle()
+            removeView(it)
+        }
+        originalComparisonView = null
+        enhancedComparisonView = null
         pageView?.let {
             processingJob?.cancel()
             processingJob = null
@@ -896,8 +966,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
             it.isVisible = false
             enhancedOverlay.setImageBitmap(null)
             enhancedOverlay.isVisible = false
-            enhancedBitmap?.recycle()
-            enhancedBitmap = null
+            recycleEnhancedBitmap()
             isSettingProcessedImage = false
             currentLoadedUri = null
             invalidate()
@@ -964,6 +1033,8 @@ open class ReaderPageImageView @JvmOverloads constructor(
         removeView(pageView)
 
         pageView = createSubsamplingPageView()
+        showOriginalComparison = EnhancementComparison.showOriginalImage
+        originalComparisonView = pageView as? SubsamplingScaleImageView
         addView(pageView, MATCH_PARENT, MATCH_PARENT)
     }
 
@@ -1069,7 +1140,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
             if (transformedSource != null) {
                 setProcessedSource(cachedFile, transformedSource = transformedSource)
             } else {
-                val bitmap = decodeEnhancedBitmap(cachedFile)
+                val bitmap = decodeEnhancedBitmap(cachedFile, EnhancedPageMemoryCache.key(mId, cId, pIdx, configHash, pageVariant))
                 if (bitmap != null) {
                     val uri = android.net.Uri.fromFile(cachedFile)
                     setImageWithCurrentCrop(ImageSource.uri(context, uri))
@@ -1181,7 +1252,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
                                 return@launchIO
                             }
 
-                            val bitmap = decodeEnhancedBitmap(file)
+                            val bitmap = decodeEnhancedBitmap(file, EnhancedPageMemoryCache.key(mId, cId, pIdx, configHash, pageVariant))
 
                             if (bitmap != null) {
                                 withUIContext {
@@ -1344,8 +1415,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
         processingJob = null
 
         enhancedOverlay.setImageBitmap(null)
-        enhancedBitmap?.recycle()
-        enhancedBitmap = null
+        recycleEnhancedBitmap()
         isSettingProcessedImage = false
         currentLoadedUri = null
         clearProcessedSwapView()
@@ -1360,6 +1430,11 @@ open class ReaderPageImageView @JvmOverloads constructor(
          */
         val decodeSemaphore = Semaphore(1) // Make public if needed, or keep private if only used here
     }
+}
+
+object EnhancementComparison {
+    @Volatile
+    var showOriginalImage: Boolean = false
 }
 
 private const val MAX_ZOOM_SCALE = 5F

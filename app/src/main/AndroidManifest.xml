@@ -197,6 +197,11 @@
             android:foregroundServiceType="shortService" />
 
         <service
+            android:name=".util.waifu2x.ImageEnhancementNpuService"
+            android:exported="false"
+            android:process=":image_enhancement" />
+
+        <service
             android:name="androidx.appcompat.app.AppLocalesMetadataHolderService"
             android:enabled="false"
             android:exported="false">

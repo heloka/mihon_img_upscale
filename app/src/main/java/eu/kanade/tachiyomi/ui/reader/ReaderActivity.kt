@@ -133,6 +133,7 @@ class ReaderActivity : BaseActivity() {
 
     companion object {
         private const val UI_BUSY_COOLDOWN_MS = 1_000L
+        private const val STATE_COMPARE_SHOWS_ORIGINAL = "reader_compare_shows_original"
 
         fun newIntent(context: Context, mangaId: Long?, chapterId: Long?): Intent {
             return Intent(context, ReaderActivity::class.java).apply {
@@ -182,6 +183,7 @@ class ReaderActivity : BaseActivity() {
     private var spatialRotationAngleY = 6.2f
     private var spatialRotationAngleZ = 4.5f
     private var spatialSceneActive by mutableStateOf(false)
+    private var compareShowsOriginal by mutableStateOf(false)
     private var spatialSceneBusy by mutableStateOf(false)
     private var showSpatialModelDownloadDialog by mutableStateOf(false)
     private var spatialModelDownloadProgress by mutableStateOf<Int?>(null)
@@ -192,6 +194,8 @@ class ReaderActivity : BaseActivity() {
      * Called when the activity is created. Initializes the presenter and configuration.
      */
     override fun onCreate(savedInstanceState: Bundle?) {
+        compareShowsOriginal = savedInstanceState?.getBoolean(STATE_COMPARE_SHOWS_ORIGINAL) ?: false
+        eu.kanade.tachiyomi.ui.reader.viewer.EnhancementComparison.showOriginalImage = compareShowsOriginal
         registerSecureActivity(this)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             overrideActivityTransition(
@@ -476,6 +480,7 @@ class ReaderActivity : BaseActivity() {
         uiBusyJob?.cancel()
         Waifu2x.setUiBusy(false)
         viewModel.state.value.viewer?.destroy()
+        eu.kanade.tachiyomi.ui.reader.viewer.EnhancementComparison.showOriginalImage = false
         
         config = null
         menuToggleToast?.cancel()
@@ -494,6 +499,7 @@ class ReaderActivity : BaseActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         persistCurrentPagerPage()
+        outState.putBoolean(STATE_COMPARE_SHOWS_ORIGINAL, compareShowsOriginal)
         super.onSaveInstanceState(outState)
     }
 
@@ -666,15 +672,19 @@ class ReaderActivity : BaseActivity() {
                 menuToggleToast = toast(if (enabled) MR.strings.on else MR.strings.off)
             },
             imageEnhancementEnabled = imageEnhancementEnabled,
-            onClickImageEnhancement = {
-                val enabled = viewModel.toggleImageEnhancement()
-                menuToggleToast?.cancel()
-                menuToggleToast = toast(
-                    stringResource(
-                        MR.strings.reader_image_enhancement_toast,
-                        stringResource(if (enabled) MR.strings.on else MR.strings.off),
-                    ),
-                )
+            compareShowsOriginal = compareShowsOriginal,
+            onClickImageComparison = {
+                if (imageEnhancementEnabled) {
+                    compareShowsOriginal = !compareShowsOriginal
+                    viewModel.state.value.viewer?.setShowOriginalImage(compareShowsOriginal)
+                    menuToggleToast?.cancel()
+                    menuToggleToast = toast(
+                        if (compareShowsOriginal) MR.strings.reader_status_raw else MR.strings.reader_status_processed,
+                    )
+                } else {
+                    menuToggleToast?.cancel()
+                    menuToggleToast = toast(MR.strings.reader_enable_image_enhancement_to_compare)
+                }
             },
             spatialSceneActive = spatialSceneActive,
             spatialSceneBusy = spatialSceneBusy,

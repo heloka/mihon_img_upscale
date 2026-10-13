@@ -211,12 +211,24 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
                                         }
                                         val tileSize = preferences.realCuganTileSize().get().coerceAtLeast(32)
                                         val precision = preferences.realCuganPrecision().get().coerceIn(0, 3)
-                                        val fp16Arithmetic = preferences.realCuganFp16Arithmetic().get()
-
                                         // Validate scale based on model capabilities
                                         val effectiveScale = ImageEnhancementCache.getEffectiveScale(model, scale, realEsrganStyle)
+                                        val requestedBackend = preferences.realCuganProcessingBackend().get()
                                         val processingBackend = Waifu2x.resolveProcessingBackend(
-                                            preferences.realCuganProcessingBackend().get(),
+                                            requestedBackend,
+                                            model,
+                                            effectiveScale,
+                                        )
+                                        // NPU requests always fall back to Vulkan FP16 storage and FP32 arithmetic.
+                                        val ncnnPrecision = Waifu2x.resolveVulkanFallbackPrecision(
+                                            precision,
+                                            requestedBackend,
+                                            model,
+                                            effectiveScale,
+                                        )
+                                        val fp16Arithmetic = Waifu2x.resolveVulkanFallbackFp16Arithmetic(
+                                            preferences.realCuganFp16Arithmetic().get(),
+                                            requestedBackend,
                                             model,
                                             effectiveScale,
                                         )
@@ -264,16 +276,16 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
 
                                         currentCoroutineContext().ensureActive()
                                         val initialized = when (model) {
-                                            0 -> Waifu2x.initRealCugan(context, noise, effectiveScale, isPro = false, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = precision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend)
-                                            1 -> Waifu2x.initRealCugan(context, noise, effectiveScale, isPro = true, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = precision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend)
-                                            Waifu2x.MODEL_REAL_ESRGAN_ANIME -> Waifu2x.initRealESRGAN(context, effectiveScale, style = realEsrganStyle, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = precision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend)
-                                            3 -> Waifu2x.initNose(context, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = precision, fp16Arithmetic = fp16Arithmetic)
-                                            4 -> Waifu2x.initWaifu2x(context, noise, effectiveScale, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = precision, fp16Arithmetic = fp16Arithmetic)
-                                            5 -> Waifu2x.initWaifu2xUpconv7(context, noise, effectiveScale, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = precision, fp16Arithmetic = fp16Arithmetic)
+                                            0 -> Waifu2x.initRealCugan(context, noise, effectiveScale, isPro = false, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend, npuPrecision = precision)
+                                            1 -> Waifu2x.initRealCugan(context, noise, effectiveScale, isPro = true, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend, npuPrecision = precision)
+                                            Waifu2x.MODEL_REAL_ESRGAN_ANIME -> Waifu2x.initRealESRGAN(context, effectiveScale, style = realEsrganStyle, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend, npuPrecision = precision)
+                                            3 -> Waifu2x.initNose(context, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic)
+                                            4 -> Waifu2x.initWaifu2x(context, noise, effectiveScale, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic)
+                                            5 -> Waifu2x.initWaifu2xUpconv7(context, noise, effectiveScale, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic)
                                             else -> if (Waifu2x.isW2xExModel(model)) {
-                                                Waifu2x.initW2xEx(context, model, scale = effectiveScale, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = precision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend)
+                                                Waifu2x.initW2xEx(context, model, scale = effectiveScale, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend, npuPrecision = precision)
                                             } else {
-                                                Waifu2x.initRealCugan(context, noise, effectiveScale, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = precision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend)
+                                                Waifu2x.initRealCugan(context, noise, effectiveScale, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend, npuPrecision = precision)
                                             }
                                         }
                                         val processed = if (initialized) when (model) {

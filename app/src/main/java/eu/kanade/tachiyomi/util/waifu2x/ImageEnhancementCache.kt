@@ -28,7 +28,9 @@ object ImageEnhancementCache {
     private const val REAL_CUGAN_NPU_INT8_CACHE_REVISION = 1
     private const val REAL_CUGAN_TEXTURE_OCCUPANCY_REVISION = 1
     private const val MONOCHROME_INPUT_NORMALIZATION_REVISION = 2
-    private const val MAX_CACHE_SIZE = 3L * 1024 * 1024 * 1024 // 3GB
+    // Generous by design: enhanced pages are traded for storage so re-reads and
+    // back-navigation are served instantly instead of re-processing.
+    private const val MAX_CACHE_SIZE = 8L * 1024 * 1024 * 1024 // 8GB
     private var cacheDir: File? = null
     // A model change clears this directory while completed pages can still be
     // waiting in the background writer. Saving holds a shared lock for its
@@ -176,6 +178,7 @@ object ImageEnhancementCache {
             val removedTemp = !tempFile.exists() || tempFile.delete()
             (removedFile && removedTemp).also { removed ->
                 if (removed) {
+                    EnhancedPageMemoryCache.removePage(mangaId, chapterId, pageIndex)
                     _events.tryEmit(CacheEvent.Removed(cacheKey(mangaId, chapterId, pageIndex, configHash, pageVariant)))
                 }
             }
@@ -373,6 +376,7 @@ object ImageEnhancementCache {
             cacheDir?.deleteRecursively()
             cacheDir?.mkdirs()
         }
+        EnhancedPageMemoryCache.clear()
         _events.tryEmit(CacheEvent.Cleared)
     }
 
@@ -463,6 +467,7 @@ object ImageEnhancementCache {
             val chapterDir = getChapterDir(mangaId, chapterId)
             if (chapterDir.exists()) {
                 chapterDir.deleteRecursively()
+                EnhancedPageMemoryCache.removeChapter(mangaId, chapterId)
                 android.util.Log.d("ImageEnhancementCache", "Cleared cache for manga $mangaId, chapter $chapterId")
             }
         } catch (e: Exception) {

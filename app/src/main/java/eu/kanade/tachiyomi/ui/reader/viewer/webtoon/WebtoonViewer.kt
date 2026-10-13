@@ -201,6 +201,13 @@ class WebtoonViewer(val activity: ReaderActivity, val isContinuous: Boolean = tr
         return frame
     }
 
+    override fun setShowOriginalImage(showOriginal: Boolean) {
+        eu.kanade.tachiyomi.ui.reader.viewer.EnhancementComparison.showOriginalImage = showOriginal
+        recycler.children
+            .mapNotNull { recycler.getChildViewHolder(it) as? WebtoonPageHolder }
+            .forEach { it.setShowOriginalImage(showOriginal) }
+    }
+
     /**
      * Destroys this viewer. Called when leaving the reader or swapping viewers.
      */

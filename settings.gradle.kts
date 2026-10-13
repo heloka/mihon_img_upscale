@@ -8,6 +8,10 @@ pluginManagement {
         }
     }
     repositories {
+        // Aliyun mirrors first for networks where gradlePluginPortal is unreachable.
+        maven(url = "https://maven.aliyun.com/repository/gradle-plugin")
+        maven(url = "https://maven.aliyun.com/repository/public")
+        maven(url = "https://maven.aliyun.com/repository/google")
         gradlePluginPortal()
         google()
         mavenCentral()
@@ -29,6 +33,8 @@ dependencyResolutionManagement {
     }
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
+        maven(url = "https://maven.aliyun.com/repository/public")
+        maven(url = "https://maven.aliyun.com/repository/google")
         mavenCentral()
         google()
         maven(url = "https://www.jitpack.io")

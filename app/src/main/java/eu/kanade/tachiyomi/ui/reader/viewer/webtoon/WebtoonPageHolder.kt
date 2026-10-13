@@ -135,6 +135,11 @@ class WebtoonPageHolder(
         segmentFrames.firstOrNull()?.promoteEnhancementRequest(highPriority = true)
     }
 
+    fun setShowOriginalImage(showOriginal: Boolean) {
+        frame.setShowOriginalImage(showOriginal)
+        segmentFrames.forEach { it.setShowOriginalImage(showOriginal) }
+    }
+
     private fun refreshLayoutParams() {
         frame.layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply {
             if (!viewer.isContinuous) {

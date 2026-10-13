@@ -7,6 +7,7 @@
 #include <android/log.h>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <queue>
@@ -127,6 +128,21 @@ private:
   bool stopping_ = false;
 };
 
+// Adreno drivers shipped with Android 16 (SDK 36+) reject the
+// cooperative-matrix FP16 compute shaders this ncnn build generates:
+// vkCreateComputePipelines returns VK_ERROR_UNKNOWN (-13), ncnn keeps null
+// pipelines, and the app SIGSEGVs inside vkCmdBindPipeline on the first
+// inference. Every other shader family is accepted, so disabling just the
+// cooperative-matrix path restores full FP16 speed on the affected driver.
+// Verified on OPPO Pad mini / Adreno 829 / SDK 36. See upstream issue #2.
+bool adreno_android16_driver() {
+  char egl[PROP_VALUE_MAX] = {0};
+  char sdk[PROP_VALUE_MAX] = {0};
+  __system_property_get("ro.hardware.egl", egl);
+  __system_property_get("ro.build.version.sdk", sdk);
+  return atoi(sdk) >= 36 && strstr(egl, "adreno") != nullptr;
+}
+
 } // namespace
 
 Waifu2x::Waifu2x(int gpuid, bool _tta_mode, int _num_threads,
@@ -217,6 +233,51 @@ int Waifu2x::load(const std::string &parampath, const std::string &modelpath) {
   net.opt.use_winograd_convolution = true; // Winograd convolution
   net.opt.use_local_pool_allocator = true; // Better memory allocation
   net.opt.use_shader_local_memory = true;  // Use shader local memory
+
+  // Driver-compatibility overrides, toggleable from adb without rebuilding:
+  //   adb shell setprop debug.waifu2x.no_coopmat 1   (cooperative matrix off)
+  //   adb shell setprop debug.waifu2x.no_subgroup 1  (subgroup ops off)
+  //   adb shell setprop debug.waifu2x.no_slm 1       (shader local memory off)
+  //   adb shell setprop debug.waifu2x.no_wino 1      (all winograd off)
+  //   adb shell setprop debug.waifu2x.no_fp16u 1     (fp16 uniform off)
+  // Used to bisect which shader-generation optimization a driver rejects.
+  {
+    char prop_value[92] = {0};
+    auto prop_on = [&prop_value](const char *name) {
+      prop_value[0] = '\0';
+      __system_property_get(name, prop_value);
+      return prop_value[0] == '1';
+    };
+    if (prop_on("debug.waifu2x.no_coopmat")) {
+      net.opt.use_cooperative_matrix = false;
+      LOGD("shader opt override: cooperative matrix off");
+    }
+    if (prop_on("debug.waifu2x.no_subgroup")) {
+      net.opt.use_subgroup_ops = false;
+      LOGD("shader opt override: subgroup ops off");
+    }
+    if (prop_on("debug.waifu2x.no_slm")) {
+      net.opt.use_shader_local_memory = false;
+      LOGD("shader opt override: shader local memory off");
+    }
+    if (prop_on("debug.waifu2x.no_wino")) {
+      net.opt.use_winograd_convolution = false;
+      net.opt.use_winograd23_convolution = false;
+      net.opt.use_winograd43_convolution = false;
+      net.opt.use_winograd63_convolution = false;
+      LOGD("shader opt override: winograd off");
+    }
+    if (prop_on("debug.waifu2x.no_fp16u")) {
+      net.opt.use_fp16_uniform = false;
+      LOGD("shader opt override: fp16 uniform off");
+    }
+  }
+
+  if (net.opt.use_cooperative_matrix && adreno_android16_driver()) {
+    net.opt.use_cooperative_matrix = false;
+    LOGD("Adreno/Android 16+ driver: cooperative matrix shaders disabled "
+         "(driver rejects them; FP16 otherwise crashes)");
+  }
 
   net.opt.num_threads = num_threads;
 

@@ -8,13 +8,17 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <fstream>
+#include <mutex>
+#include <set>
 #include <string>
+#include <sys/system_properties.h>
 #include <vector>
 
 #if MIHON_ENABLE_QNN
 #include <HTP/QnnHtpDevice.h>
 #include <QnnInterface.h>
 #include <System/QnnSystemInterface.h>
+#include "qnn_jni/QnnWrapperUtils.hpp"
 #endif
 
 #define TAG "QnnBackend"
@@ -157,6 +161,11 @@ int reflect_coordinate(int coordinate, int size) {
 
 class Runtime {
 public:
+  // Public because the qnn_backend wrappers below (outside the class) must
+  // serialize entry points against a possibly-hung model-library build thread.
+  std::mutex api_mutex_;
+  std::set<std::string> failed_builds_;
+
   ~Runtime() { reset(); }
 
   bool probe() {
@@ -170,26 +179,27 @@ public:
     return result;
   }
 
-  int architecture() {
+  std::array<int, 2> platform_info() {
     void *handle = dlopen("libQnnHtp.so", RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
       LOGE("Unable to load libQnnHtp.so while detecting architecture: %s",
            dlerror());
-      return 0;
+      return {0, -1};
     }
     const QnnInterface_t *provider = find_qnn_provider(handle);
     if (!provider) {
       dlclose(handle);
-      return 0;
+      return {0, -1};
     }
     const auto &qnn = provider->QNN_INTERFACE_VER_NAME;
     if (!qnn.deviceGetPlatformInfo || !qnn.deviceFreePlatformInfo) {
       dlclose(handle);
-      return 0;
+      return {0, -1};
     }
 
     const QnnDevice_PlatformInfo_t *platform_info = nullptr;
     int result = 0;
+    int soc_model = -1;
     if (qnn.deviceGetPlatformInfo(nullptr, &platform_info) == QNN_SUCCESS &&
         platform_info &&
         platform_info->version == QNN_DEVICE_PLATFORM_INFO_VERSION_1) {
@@ -204,6 +214,7 @@ public:
                 device.v1.deviceInfoExtension);
         if (extension->devType == QNN_HTP_DEVICE_TYPE_ON_CHIP) {
           result = static_cast<int>(extension->onChipDevice.arch);
+          soc_model = static_cast<int>(extension->onChipDevice.socModel);
           break;
         }
       }
@@ -212,11 +223,12 @@ public:
       qnn.deviceFreePlatformInfo(nullptr, platform_info);
     }
     dlclose(handle);
-    LOGD("Detected HTP architecture v%d from QNN platform info", result);
-    return result;
+    LOGD("Detected HTP architecture v%d and QNN SoC model %d from platform info",
+         result, soc_model);
+    return {result, soc_model};
   }
 
-  bool load(const std::string &context_path, int padding) {
+  bool load(const std::string &context_path, int padding, bool input_bgr) {
     deactivate();
     if (!ensure_runtime()) {
       return false;
@@ -262,6 +274,7 @@ public:
     }
     graph_name_ = metadata.name;
     system.systemContextFree(system_context);
+    execute_failures_ = 0;
 
     if (!validate_tensor(input_) || !validate_tensor(output_) ||
         input_.v2.dimensions[1] != input_.v2.dimensions[2] ||
@@ -328,6 +341,7 @@ public:
                         output_quant8_buffer_.size());
     }
     padding_ = std::clamp(padding, 0, 48);
+    input_bgr_ = input_bgr;
     configure_performance();
     initialized_ = true;
     LOGD("Loaded QNN graph %s with tile %dx%d, scale %dx, %s IO and padding %d",
@@ -337,10 +351,154 @@ public:
     return true;
   }
 
+  // Compose + finalize a QNN model library (converted from ONNX by the
+  // qnn-onnx-converter) inside this process, serialize the compiled context and
+  // then load it through the normal path. The HTP backend refuses to build
+  // graphs from cache-less DLCs, so this is the only way to consume a freshly
+  // converted model without a host-side context-binary-generator run.
+  bool build_from_model_lib(const std::string &lib_path,
+                            const std::string &out_binary_path,
+                            const int padding, const bool input_bgr) {
+    if (failed_builds_.count(lib_path)) {
+      LOGE("QNN model library %s previously failed to build; skipping", lib_path.c_str());
+      return false;
+    }
+    deactivate();
+    if (!ensure_runtime()) {
+      return false;
+    }
+    const auto &qnn = provider_->QNN_INTERFACE_VER_NAME;
+
+    void *model_lib = dlopen(lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!model_lib) {
+      LOGE("Unable to load model library %s: %s", lib_path.c_str(), dlerror());
+      return false;
+    }
+    using ComposeFn = qnn_wrapper_api::ModelError_t (*)(
+        Qnn_BackendHandle_t, QnnInterface_ImplementationV2_40_t,
+        Qnn_ContextHandle_t, const qnn_wrapper_api::GraphConfigInfo_t **,
+        const uint32_t, qnn_wrapper_api::GraphInfoPtr_t **, uint32_t *, bool,
+        QnnLog_Callback_t, QnnLog_Level_t);
+    using FreeFn = qnn_wrapper_api::ModelError_t (*)(
+        qnn_wrapper_api::GraphInfoPtr_t **, uint32_t);
+    auto compose = reinterpret_cast<ComposeFn>(
+        dlsym(model_lib, "QnnModel_composeGraphs"));
+    auto free_graphs = reinterpret_cast<FreeFn>(
+        dlsym(model_lib, "QnnModel_freeGraphsInfo"));
+    if (!compose || !free_graphs) {
+      LOGE("Model library %s is missing QnnModel symbols", lib_path.c_str());
+      dlclose(model_lib);
+      return false;
+    }
+
+    Qnn_ErrorHandle_t status =
+        qnn.contextCreate(backend_, device_, nullptr, &context_);
+    if (status != QNN_SUCCESS) {
+      LOGE("QNN contextCreate failed: %u", static_cast<unsigned>(status));
+      dlclose(model_lib);
+      deactivate();
+      return false;
+    }
+
+    qnn_wrapper_api::GraphInfoPtr_t *graphs = nullptr;
+    uint32_t num_graphs = 0;
+    auto model_error = compose(
+        backend_, provider_->QNN_INTERFACE_VER_NAME, context_, nullptr, 0,
+        &graphs, &num_graphs, false, nullptr, QNN_LOG_LEVEL_ERROR);
+    if (model_error != qnn_wrapper_api::MODEL_NO_ERROR || !graphs ||
+        num_graphs == 0) {
+      LOGE("QNN model library composition failed: %d", static_cast<int>(model_error));
+      dlclose(model_lib);
+      deactivate();
+      failed_builds_.insert(lib_path);
+      return false;
+    }
+
+    for (uint32_t i = 0; i < num_graphs; ++i) {
+      const auto &info = graphs[i];
+      Qnn_GraphHandle_t handle = nullptr;
+      status = qnn.graphRetrieve(context_, info->graphName, &handle);
+      if (status == QNN_SUCCESS) {
+        status = qnn.graphFinalize(handle, nullptr, nullptr);
+      }
+      if (status != QNN_SUCCESS) {
+        LOGE("QNN graphFinalize failed for %s: %u", info->graphName,
+             static_cast<unsigned>(status));
+        free_graphs(&graphs, num_graphs);
+        dlclose(model_lib);
+        deactivate();
+        failed_builds_.insert(lib_path);
+        return false;
+      }
+    }
+
+    Qnn_ContextBinarySize_t binary_size = 0;
+    status = qnn.contextGetBinarySize(context_, &binary_size);
+    if (status != QNN_SUCCESS || binary_size == 0) {
+      LOGE("QNN contextGetBinarySize failed");
+      free_graphs(&graphs, num_graphs);
+      dlclose(model_lib);
+      deactivate();
+      return false;
+    }
+    std::vector<uint8_t> compiled(static_cast<size_t>(binary_size));
+    Qnn_ContextBinarySize_t written = 0;
+    status = qnn.contextGetBinary(context_, compiled.data(), binary_size, &written);
+    if (status != QNN_SUCCESS || written == 0) {
+      LOGE("QNN contextGetBinary failed: %u", static_cast<unsigned>(status));
+      free_graphs(&graphs, num_graphs);
+      dlclose(model_lib);
+      deactivate();
+      return false;
+    }
+    const std::string partial = out_binary_path + ".partial";
+    {
+      std::ofstream output(partial, std::ios::binary | std::ios::trunc);
+      output.write(reinterpret_cast<const char *>(compiled.data()),
+                   static_cast<std::streamsize>(written));
+      if (!output) {
+        output.close();
+        std::remove(partial.c_str());
+        LOGE("Unable to write compiled QNN context: %s", partial.c_str());
+        free_graphs(&graphs, num_graphs);
+        dlclose(model_lib);
+        deactivate();
+        return false;
+      }
+    }
+    free_graphs(&graphs, num_graphs);
+    dlclose(model_lib);
+    // Drop the composed context; load() re-creates it from the serialized form
+    // so the rest of the pipeline sees a uniform state.
+    deactivate();
+
+    std::ifstream check(partial, std::ios::binary | std::ios::ate);
+    if (!check || check.tellg() <= 0) {
+      std::remove(partial.c_str());
+      failed_builds_.insert(lib_path);
+      return false;
+    }
+    check.close();
+    if (std::rename(partial.c_str(), out_binary_path.c_str()) != 0) {
+      std::remove(partial.c_str());
+      LOGE("Unable to atomically install QNN context: %s", out_binary_path.c_str());
+      failed_builds_.insert(lib_path);
+      return false;
+    }
+    LOGD("QNN built context from model library: %s (%lld bytes)",
+         out_binary_path.c_str(), static_cast<long long>(written));
+    return load(out_binary_path, padding, input_bgr);
+  }
+
   int process(const uint8_t *input, int width, int height, int input_stride,
               uint8_t *output, int output_stride, std::atomic<int> *progress,
               const std::atomic<bool> *should_abort) {
     if (!initialized_ || !input || !output || width <= 0 || height <= 0) {
+      return -1;
+    }
+    if (execute_failures_ >= 2) {
+      // This graph keeps failing at execute time (driver/firmware issue);
+      // short-circuit so the Vulkan fallback takes over without per-tile cost.
       return -1;
     }
     const int core = tile_size_ - 2 * padding_;
@@ -379,6 +537,10 @@ public:
         execute_time += std::chrono::steady_clock::now() - stage_start;
         if (status != QNN_SUCCESS) {
           LOGE("QNN graphExecute failed: %u", static_cast<unsigned>(status));
+          if (++execute_failures_ >= 2) {
+            session_failed_ = true;
+            LOGE("QNN NPU disabled for this session after repeated execute failures");
+          }
           return -1;
         }
 
@@ -416,6 +578,8 @@ public:
 
   bool initialized() const { return initialized_; }
 
+  int output_scale() const { return scale_; }
+
   void deactivate() {
     initialized_ = false;
     if (provider_) {
@@ -436,6 +600,7 @@ public:
     binary_.clear();
     tile_size_ = 0;
     output_tile_size_ = 0;
+    input_bgr_ = false;
     scale_ = 0;
   }
 
@@ -515,6 +680,26 @@ private:
   }
 
   void configure_performance() {
+    // The full-burst DCVS config has hung on some newer HTP firmware. The
+    // OPPO Pad mini's SM8845P / canoe / HTP v81 combination was verified with
+    // burst enabled; it is substantially faster than the default low-power
+    // clocks. Keep the debug opt-out for unvalidated targets, but don't let a
+    // stale opt-out property disable the validated SM8845P path.
+    char noburst[8] = {0};
+    __system_property_get("debug.waifu2x.qnn_noburst", noburst);
+    char soc_model[PROP_VALUE_MAX] = {0};
+    char board_platform[PROP_VALUE_MAX] = {0};
+    __system_property_get("ro.soc.model", soc_model);
+    __system_property_get("ro.board.platform", board_platform);
+    const bool validated_sm8845p = std::strcmp(soc_model, "SM8845P") == 0 &&
+                                   std::strcmp(board_platform, "canoe") == 0;
+    if (noburst[0] == '1' && !validated_sm8845p) {
+      LOGD("QNN HTP burst performance configuration skipped (debug.waifu2x.qnn_noburst)");
+      return;
+    }
+    if (noburst[0] == '1' && validated_sm8845p) {
+      LOGD("Ignoring stale no-burst opt-out on validated SM8845P / canoe target");
+    }
     const auto &qnn = provider_->QNN_INTERFACE_VER_NAME;
     if (!qnn.deviceGetInfrastructure) {
       return;
@@ -771,8 +956,9 @@ private:
           if (!guard_tile) {
             const int source_y = reflect_coordinate(origin_y + y, height);
             const int source_x = reflect_coordinate(origin_x + x, width);
+            const int source_channel = input_bgr_ ? 2 - channel : channel;
             value = input[static_cast<size_t>(source_y) * stride +
-                          static_cast<size_t>(source_x) * 4 + channel] /
+                          static_cast<size_t>(source_x) * 4 + source_channel] /
                     255.0f;
           } else if (x < border || y < border ||
                      x >= border + scaled_size || y >= border + scaled_size) {
@@ -786,13 +972,15 @@ private:
             const int y0 = static_cast<int>(std::floor(source_y));
             const float fx = source_x - x0;
             const float fy = source_y - y0;
+            const int source_channel = input_bgr_ ? 2 - channel : channel;
             const int rx0 = reflect_coordinate(x0, width);
             const int rx1 = reflect_coordinate(x0 + 1, width);
             const int ry0 = reflect_coordinate(y0, height);
             const int ry1 = reflect_coordinate(y0 + 1, height);
             const auto pixel = [&](int sx, int sy) {
               return input[static_cast<size_t>(sy) * stride +
-                           static_cast<size_t>(sx) * 4 + channel] / 255.0f;
+                           static_cast<size_t>(sx) * 4 + source_channel] /
+                     255.0f;
             };
             const float top = pixel(rx0, ry0) * (1.0f - fx) +
                               pixel(rx1, ry0) * fx;
@@ -853,7 +1041,9 @@ private:
             raw_value = top * (1.0f - fy) + bottom * fy;
           }
           const float value = std::clamp(raw_value, 0.0f, 1.0f);
-          row[x * 4 + channel] = static_cast<uint8_t>(value * 255.0f + 0.5f);
+          const int target_channel = input_bgr_ ? 2 - channel : channel;
+          row[x * 4 + target_channel] =
+              static_cast<uint8_t>(value * 255.0f + 0.5f);
         }
         const int alpha_x = std::min(width - 1, (target_x + x) / scale_);
         const int alpha_y = std::min(height - 1, (target_y + y) / scale_);
@@ -896,6 +1086,7 @@ private:
   std::vector<uint8_t> input_quant8_buffer_;
   std::vector<uint8_t> output_quant8_buffer_;
   int padding_ = 0;
+  bool input_bgr_ = false;
   int tile_size_ = 0;
   int output_tile_size_ = 0;
   int scale_ = 0;
@@ -903,6 +1094,11 @@ private:
       QNN_HTP_DEVICE_PERF_INFRASTRUCTURE_INIT;
   uint32_t power_config_id_ = 0;
   bool initialized_ = false;
+  // After repeated graphExecute failures (driver/firmware incompatibilities on
+  // some SoC generations) the NPU is abandoned for the rest of the session so
+  // every page stops paying the retry cost; the Vulkan fallback takes over.
+  int execute_failures_ = 0;
+  bool session_failed_ = false;
 };
 
 Runtime runtime;
@@ -920,18 +1116,44 @@ bool is_runtime_loadable() {
 
 int architecture() {
 #if MIHON_ENABLE_QNN
-  return runtime.architecture();
+  return runtime.platform_info()[0];
 #else
   return 0;
 #endif
 }
 
-bool initialize(const std::string &context_path, int padding) {
+std::array<int, 2> platform_info() {
 #if MIHON_ENABLE_QNN
-  return runtime.load(context_path, padding);
+  return runtime.platform_info();
+#else
+  return {0, -1};
+#endif
+}
+
+bool initialize(const std::string &context_path, int padding, bool input_bgr) {
+#if MIHON_ENABLE_QNN
+  std::lock_guard<std::mutex> lock(runtime.api_mutex_);
+  return runtime.load(context_path, padding, input_bgr);
 #else
   (void)context_path;
   (void)padding;
+  (void)input_bgr;
+  return false;
+#endif
+}
+
+bool build_from_model_lib(const std::string &model_lib_path,
+                          const std::string &out_context_path,
+                          int padding, bool input_bgr) {
+#if MIHON_ENABLE_QNN
+  std::lock_guard<std::mutex> lock(runtime.api_mutex_);
+  return runtime.build_from_model_lib(model_lib_path, out_context_path, padding,
+                                      input_bgr);
+#else
+  (void)model_lib_path;
+  (void)out_context_path;
+  (void)padding;
+  (void)input_bgr;
   return false;
 #endif
 }
@@ -941,6 +1163,14 @@ bool is_initialized() {
   return runtime.initialized();
 #else
   return false;
+#endif
+}
+
+int output_scale() {
+#if MIHON_ENABLE_QNN
+  return runtime.output_scale();
+#else
+  return 0;
 #endif
 }
 
@@ -966,6 +1196,7 @@ int process_rgba(const uint8_t *input, int width, int height, int input_stride,
 
 void shutdown() {
 #if MIHON_ENABLE_QNN
+  std::lock_guard<std::mutex> lock(runtime.api_mutex_);
   runtime.deactivate();
 #endif
 }

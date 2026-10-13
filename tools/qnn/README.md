@@ -1,148 +1,62 @@
-# Qualcomm QNN model pipeline
+# Qualcomm QNN / HTP image-enhancement path
 
-Supported targets are HTP v69, v73, v75, v79, and v81. Runtime selection and cache names use
-only the HTP architecture, so another Qualcomm chip with the same HTP version reuses the same
-context. Models use a fixed 256x256 RGB NCHW input tile and produce a 512x512 or 768x768 RGB
-NCHW output tile.
+## Current device and build status
 
-| Product | SoC | HTP architecture |
-| --- | --- | --- |
-| Snapdragon 8+ Gen 1 | SM8475 | v69 |
-| Snapdragon 8 Gen 2 | SM8550 | v73 |
-| Snapdragon 8 Gen 3 | SM8650 | v75 |
-| Snapdragon 8 Elite | SM8750 | v79 |
-| Snapdragon 8 Elite Gen 5 | SM8850 | v81 |
+The attached OPPO Pad mini reports `SM8845P` and `canoe` on Android 16. The app's
+instrumentation test queried QAIRT's platform API on that device and detected HTP v81.
+Model selection uses that runtime result and an exact-architecture asset manifest; it does
+not infer an HTP version from a Snapdragon product name or try v81/v85 speculatively.
 
-Supported models:
+The checked-in QNN payloads currently target v81. Their presence means that an artifact is
+packaged, not that its graph has passed HTP execution or quality checks. See
+[`NPU_DEVICE_TEST_REPORT.md`](../../NPU_DEVICE_TEST_REPORT.md) for the observed model-library
+linker failures and the limits of the device testing completed so far.
 
-- Real-ESRGAN animevideov3 2x: FP16 and INT8
-- Real-ESRGAN general-x4v3 Photo 2x output: FP16 and W8A16 mixed precision
-- Real-CUGAN SE 2x: FP16 and W8A16 for no-denoise, denoise1x, denoise2x,
-  denoise3x, and conservative
-- Real-CUGAN Pro 2x and 3x: FP16 and W8A16 for no-denoise, denoise3x, and conservative
-- W2xEX Photo Small 2x: FP16 and W8A16 mixed precision
-- SPAN NomosUni Photo 2x: FP16 and W8A16 mixed precision
+When `local.properties` contains `qnn.sdk.dir`, Gradle's `stageQnnRuntime` task copies the
+QNN HTP, System, HTP Prepare, Model DLC, v81 Stub, and v81 Skel from that single QAIRT SDK
+tree. The default `qnn.htp.archs` is `81`, matching the only checked-in payload generation.
+Add another target only after its assets and matching runtime Stub/Skel are available. The
+release APK is signed by the configured Gradle signing config; no post-build APK edits are
+part of the workflow.
 
-Local prerequisites are configured through ignored `local.properties` values:
+Build the arm64 release APK with JDK 17 and the Android SDK configured:
 
-```properties
-qnn.sdk.dir=/absolute/path/to/qairt/version
-qnn.htp.archs=69,73,75,79,81
-qnn.context.dir=/absolute/path/to/generated/contexts
+```powershell
+$env:JAVA_HOME = 'C:\path\to\jdk-17'
+$env:ANDROID_HOME = 'C:\path\to\Android\Sdk'
+./gradlew.bat :app:testReleaseUnitTest :app:assembleRelease --console=plain
 ```
 
-Gradle downloads Qualcomm's official `com.qualcomm.qti:qnn-runtime:2.49.0` Android runtime.
-It packages the matching HTP Stub and Skel libraries for v69, v73, v75, v79, and v81, so
-these runtime files do not need to be copied from the local SDK. The SDK path is still needed
-for QNN headers and the model conversion/context generation tools.
+The NPU asset manifest pins each payload SHA-256, model family, precision, output scale,
+NCHW RGB input/output layout, and HTP architecture. `build_model_manifest.py` can also audit
+Android model-library dynamic symbols. Use the same NDK that builds the app:
 
-Export the upstream PyTorch weights to ONNX with `export_models.py`. The resulting ONNX
-files are development inputs and should not be committed. QNN conversion and quantization
-scripts will consume these fixed-shape graphs and emit Android context binaries. Build the
-amd64 Linux converter environment before running either conversion path:
-
-Real-CUGAN Pro is reconstructed from the official NCNN `models-pro` parameter and FP16 weight
-files because an equivalent upstream PyTorch checkpoint is not published. Export SE and Pro with:
-
-```sh
-python tools/qnn/export_models.py \
-  --realcugan-source "$REALCUGAN_SOURCE/upcunet_v3.py" \
-  --realcugan-weights-dir "$REALCUGAN_WEIGHTS" \
-  --realcugan-pro-model-dir "$REALCUGAN_NCNN/models-pro" \
-  --output-dir "$ONNX_DIR" \
-  --tile-size 256 \
-  --scales 2 3
+```powershell
+python tools/qnn/build_model_manifest.py app/src/main/assets/qnn-contexts `
+  --llvm-nm C:\path\to\Android\Sdk\ndk\28.2.13676358\toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-nm.exe
+python tools/qnn/test_build_model_manifest.py
 ```
 
-SPAN export additionally requires `spandrel`, `spandrel-extra-arches`, and `pnnx`. Use
-`export_span_ncnn.py` to create the BGR-compatible NCNN asset; its first layer,
-normalization mean, and PixelShuffle output are reordered without changing the RGB QNN graph.
-Use `export_w2xex_onnx.py` to reconstruct the W2xEX Photo Small ONNX graph from its upstream
-NCNN parameter and weight files. The exporter converts the model's BGR channel order to RGB.
+The audit records model libraries with unlinked QNN-converter weight-blob symbols as
+`runtimeEligible: false`. Runtime code skips those `.model.so` files and tries a packaged
+`.bin`/`.dlc` only for the architecture reported by QNN. A missing or failing context falls
+through to the existing Vulkan path. A successful graph load alone is not evidence of a
+successful inference.
 
-```sh
-docker build --platform linux/amd64 -t mihon-qnn-tools:2.49.0 tools/qnn
-```
+## Export and context generation
 
-Convert the exported models to FP16:
+`export_models.py`, `export_span_ncnn.py`, `export_w2xex_onnx.py`, and the converter/container
+scripts are development tools for regenerating payloads. Their converter versions and
+weights must be recorded alongside each generated artifact before results can be compared.
+The currently checked-in payloads do not pin source-checkpoint revisions, and the existing
+container recipe uses an older QAIRT toolchain than the runtime packaged in the app. Do not
+mix outputs from those paths and describe them as reproducible QAIRT 2.51 artifacts without
+rebuilding and recording the tool versions.
 
-```sh
-docker run --rm --platform linux/amd64 \
-  -v "$QNN_SDK_ROOT:/qnn:ro" \
-  -v "$ONNX_DIR:/models:ro" \
-  -v "$CONVERTED_DIR:/output" \
-  -e ONNX_DIR=/models \
-  -e OUTPUT_DIR=/output \
-  mihon-qnn-tools:2.49.0 \
-  convert-qnn-models
-```
-
-Create calibration inputs and convert the supported models to W8A16. The calibration input
-list paths must match the path mounted inside the converter container.
-
-```sh
-python tools/qnn/prepare_calibration.py \
-  --image-dir "$CALIBRATION_IMAGE_DIR" \
-  --output-dir "$CALIBRATION_DIR" \
-  --tile-size 256 \
-  --samples 64 \
-  --input-list-prefix /calibration
-
-docker run --rm --platform linux/amd64 \
-  -v "$QNN_SDK_ROOT:/qnn:ro" \
-  -v "$ONNX_DIR:/models:ro" \
-  -v "$CALIBRATION_DIR:/calibration:ro" \
-  -v "$INT8_CONVERTED_DIR:/output" \
-  -e ONNX_DIR=/models \
-  -e CALIBRATION_INPUT_LIST=/calibration/input-list.txt \
-  -e OUTPUT_DIR=/output \
-  mihon-qnn-tools:2.49.0 \
-  convert-qnn-int8-models
-```
-
-Compile the converter output into model libraries used for HTP context generation:
-
-```sh
-docker run --rm --platform linux/amd64 \
-  -v "$QNN_SDK_ROOT:/qnn:ro" \
-  -v "$CONVERTED_DIR:/converted:ro" \
-  -v "$MODEL_LIB_DIR:/output" \
-  -e CONVERTED_DIR=/converted \
-  -e OUTPUT_DIR=/output \
-  mihon-qnn-tools:2.49.0 \
-  compile-qnn-model-libs
-
-docker run --rm --platform linux/amd64 \
-  -v "$QNN_SDK_ROOT:/qnn:ro" \
-  -v "$INT8_CONVERTED_DIR:/converted:ro" \
-  -v "$INT8_MODEL_LIB_DIR:/output" \
-  -e CONVERTED_DIR=/converted \
-  -e OUTPUT_DIR=/output \
-  mihon-qnn-tools:2.49.0 \
-  compile-qnn-model-libs
-```
-
-The generated libraries intentionally keep the converter's default `QnnModel` symbol
-prefix. QAIRT 2.49 still displays `--model_prefix` in the context generator help, but the
-option is no longer applied to model libraries. Using a filename-derived prefix causes the
-generator to fail while looking up `QnnModel_composeGraphs`.
-
-Generate offline contexts for all supported HTP versions. QAIRT's model-library
-workflow must pass each target through `--soc_model`; `--htp_socs` only selects targets for the
-DLC offline-cache workflow and otherwise leaves model-library contexts on the default HTP
-architecture. The generation script accepts HTP versions and internally maps them to the
-representative QAIRT generator ID required by that tool. Output files are named by HTP version.
-
-```sh
-docker run --rm --platform linux/amd64 \
-  -v "$QNN_SDK_ROOT:/qnn:ro" \
-  -v "$MODEL_LIB_DIR:/models:ro" \
-  -v "$INT8_MODEL_LIB_DIR:/models-int8:ro" \
-  -v "$CONTEXT_DIR:/output" \
-  -e MODEL_LIB_DIR=/models \
-  -e INT8_MODEL_LIB_DIR=/models-int8 \
-  -e OUTPUT_DIR=/output \
-  -e QNN_HTP_ARCHS=69,73,75,79,81 \
-  mihon-qnn-tools:2.49.0 \
-  generate-qnn-contexts
-```
+For any model change, validate the export against its source implementation first: layer
+mapping, transposed-convolution weights, RGB/BGR conversion, normalization, padding/cropping,
+and residual/output-range transforms. Then compare QNN output to the validated export on
+fixed monochrome, color, halftone, and text samples. Do not mark a model available because
+conversion or graph initialization succeeded. Pro's `(x - 0.15) / 0.7` output mapping is now
+present in the ONNX exporter but has not yet passed the planned NCNN/PyTorch output-parity
+suite.

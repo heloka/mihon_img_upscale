@@ -287,6 +287,9 @@ class ReaderViewModel @JvmOverloads constructor(
                 eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.reset(startingPage)
 
                 val context = Injekt.get<Application>()
+                // Warm the native upscaler while the chapter itself is still loading
+                // so the first page skips the model cold start.
+                eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.warmUp(context)
                 val source = sourceManager.getOrStub(manga.source)
                 loader = ChapterLoader(context, downloadManager, downloadProvider, manga, source)
 

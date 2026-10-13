@@ -1,0 +1,18 @@
+{
+  "formatVersion": 1,
+  "assets": {
+    "realesrgan-animevideov3-x2.v81.model.so": {
+      "modelVersion": "RealESRGAN AnimeVideo v3 x2 / v3-anime-x2 NCNN assets",
+      "sourceModelFiles": [
+        "realesrgan-models/v3-anime/x2.param",
+        "realesrgan-models/v3-anime/x2.bin"
+      ],
+      "sourceModelSha256": "f57fe714dd512f1ff67d1116754ab019b55a21d1c31b8f769c2dad0954b78653",
+      "compatibleSocModels": [97],
+      "tileSize": 128,
+      "tilePadding": 18,
+      "inputLayout": "NCHW_BGR",
+      "outputLayout": "NCHW_BGR"
+    }
+  }
+}

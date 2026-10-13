@@ -30,6 +30,23 @@ val localProperties = Properties().apply {
     }
 }
 
+// Personal release signing; credentials live only in local.properties (or env
+// vars) so they never enter version control. Without these the release build
+// stays unsigned, matching upstream behavior.
+val releaseKeystoreFile = localProperties.getProperty("keystore.file")
+    ?: System.getenv("MIHON_KEYSTORE_FILE")
+val releaseKeystorePassword = localProperties.getProperty("keystore.password")
+    ?: System.getenv("MIHON_KEYSTORE_PASSWORD")
+val releaseKeyAlias = localProperties.getProperty("keystore.alias")
+    ?: System.getenv("MIHON_KEY_ALIAS")
+val releaseKeyPassword = localProperties.getProperty("keystore.aliasPassword")
+    ?: localProperties.getProperty("keystore.password")
+    ?: System.getenv("MIHON_KEY_PASSWORD")
+val hasReleaseSigning = !releaseKeystoreFile.isNullOrBlank() &&
+    !releaseKeystorePassword.isNullOrBlank() &&
+    !releaseKeyAlias.isNullOrBlank() &&
+    !releaseKeyPassword.isNullOrBlank()
+
 val bundledNcnnSdkDir = rootProject.file("third_party/ncnn-20260113-android-vulkan")
 
 // AGP cannot shrink resources for an App Bundle when ABI split APKs are enabled.
@@ -49,7 +66,9 @@ val qnnHtpArchs = (
     providers.gradleProperty("qnnHtpArchs").orNull
         ?: localProperties.getProperty("qnn.htp.archs")
         ?: localProperties.getProperty("qnn.htp.arch")
-        ?: "69,73,75,79,81"
+        // The checked-in manifest currently contains v81 artifacts only.
+        // Add a target here when its model payloads and matching QAIRT Stub/Skel are present.
+        ?: "81"
     ).split(',').map(String::trim).filter(String::isNotEmpty).distinct()
 
 val qnnContextDir = providers.gradleProperty("qnnContextDir").orNull
@@ -65,6 +84,8 @@ val qnnContextTargets = listOf(
     73 to "SM8550",
     75 to "SM8650",
     79 to "SM8750",
+    // QAIRT's legacy v81 context-input filename alias only; device matching
+    // always uses the HTP architecture queried from the runtime.
     81 to "SM8850",
 )
 val selectedQnnContextTargets = qnnContextTargets.filter { (htpArch, _) ->
@@ -126,14 +147,32 @@ val stageQnnContexts = qnnContextRoot?.let { contextRoot ->
         }
     }
 }
-val stageQnnDlcRuntime = qnnSdkRoot?.let { sdkRoot ->
-    val modelDlcLibrary = sdkRoot.resolve("lib/aarch64-android/libQnnModelDlc.so")
-    tasks.register<Sync>("stageQnnDlcRuntime") {
-        from(modelDlcLibrary)
+val stageQnnRuntime = qnnSdkRoot?.let { sdkRoot ->
+    val androidRuntime = sdkRoot.resolve("lib/aarch64-android")
+    val targets = selectedQnnContextTargets.map { it.first }.ifEmpty { listOf(81) }
+    tasks.register<Sync>("stageQnnRuntime") {
+        from(androidRuntime) {
+            include("libQnnHtp.so", "libQnnSystem.so", "libQnnHtpPrepare.so", "libQnnModelDlc.so")
+        }
+        targets.forEach { arch ->
+            from(androidRuntime) { include("libQnnHtpV${arch}Stub.so") }
+            from(sdkRoot.resolve("lib/hexagon-v${arch}/unsigned")) { include("libQnnHtpV${arch}Skel.so") }
+        }
         into(generatedQnnJniLibsDir.map { it.dir("arm64-v8a") })
         doFirst {
-            check(modelDlcLibrary.isFile) {
-                "QNN DLC runtime not found: ${modelDlcLibrary.absolutePath}"
+            val required = buildList {
+                add(androidRuntime.resolve("libQnnHtp.so"))
+                add(androidRuntime.resolve("libQnnSystem.so"))
+                add(androidRuntime.resolve("libQnnHtpPrepare.so"))
+                add(androidRuntime.resolve("libQnnModelDlc.so"))
+                targets.forEach { arch ->
+                    add(androidRuntime.resolve("libQnnHtpV${arch}Stub.so"))
+                    add(sdkRoot.resolve("lib/hexagon-v${arch}/unsigned/libQnnHtpV${arch}Skel.so"))
+                }
+            }
+            val missing = required.filterNot(File::isFile)
+            check(missing.isEmpty()) {
+                "QNN SDK is missing files required for a consistent runtime package: ${missing.joinToString()}"
             }
         }
     }
@@ -145,8 +184,8 @@ android {
     defaultConfig {
         applicationId = "app.mihon"
 
-        versionCode = 37
-        versionName = "1.3.10"
+        versionCode = 68
+        versionName = "1.3.10.27"
 
         buildConfigField("String", "COMMIT_COUNT", "\"${getCommitCount()}\"")
         buildConfigField("String", "COMMIT_SHA", "\"${getGitSha()}\"")
@@ -155,6 +194,7 @@ android {
         buildConfigField("boolean", "UPDATER_ENABLED", "${Config.enableUpdater}")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        testBuildType = "release"
 
         externalNativeBuild {
             cmake {
@@ -169,6 +209,17 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("personalRelease") {
+                storeFile = rootProject.file(releaseKeystoreFile!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         val debug by getting {
             applicationIdSuffix = ".dev"
@@ -176,12 +227,16 @@ android {
             isPseudoLocalesEnabled = true
         }
         val release by getting {
-            isMinifyEnabled = Config.enableCodeShrink
-            isShrinkResources = Config.enableCodeShrink
+            isMinifyEnabled = false
+            isShrinkResources = false
 
             proguardFiles("proguard-android-optimize.txt", "proguard-rules.pro")
 
             buildConfigField("String", "BUILD_TIME", "\"${getBuildTime(useLastCommitTime = true)}\"")
+
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("personalRelease")
+            }
         }
 
         val commonMatchingFallbacks = listOf(release.name)
@@ -225,7 +280,7 @@ android {
         if (stageQnnContexts != null) {
             getByName("main").assets.srcDir(generatedQnnAssetsDir)
         }
-        if (stageQnnDlcRuntime != null) {
+        if (stageQnnRuntime != null) {
             getByName("main").jniLibs.srcDir(generatedQnnJniLibsDir)
         }
     }
@@ -314,10 +369,10 @@ if (stageQnnContexts != null) {
     }
 }
 
-if (stageQnnDlcRuntime != null) {
+if (stageQnnRuntime != null) {
     tasks.configureEach {
         if (name.startsWith("merge") && name.endsWith("JniLibFolders")) {
-            dependsOn(stageQnnDlcRuntime)
+            dependsOn(stageQnnRuntime)
         }
     }
 }
@@ -341,9 +396,26 @@ kotlin {
     }
 }
 
+// Windows AIDL invocation comments contain paths such as "\\util". Java
+// processes Unicode escapes before parsing comments, so javac rejects those
+// generated source files. The invocation line is build metadata only.
+tasks.withType<com.android.build.gradle.tasks.AidlCompile>().configureEach {
+    doLast {
+        sourceOutputDir.get().asFile.walkTopDown()
+            .filter { it.isFile && it.extension == "java" }
+            .forEach { generated ->
+                val lines = generated.readLines()
+                if (lines.any { it.startsWith(" * Using: ") }) {
+                    generated.writeText(
+                        lines.filterNot { it.startsWith(" * Using: ") }
+                            .joinToString(System.lineSeparator(), postfix = System.lineSeparator()),
+                    )
+                }
+            }
+    }
+}
+
 dependencies {
-    // Packages the matching HTP Stub/Skel libraries for every supported Snapdragon generation.
-    implementation("com.qualcomm.qti:qnn-runtime:2.49.0")
     androidTestImplementation(androidx.test.ext)
     androidTestImplementation("androidx.test:runner:1.7.0")
 

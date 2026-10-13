@@ -934,6 +934,10 @@
     <string name="action_webview_close_tab">关闭标签</string>
     <string name="reader_image_enhancement">图像增强</string>
     <string name="reader_image_enhancement_toast">图像增强%1$s</string>
+    <string name="reader_show_original_image">显示原图</string>
+    <string name="reader_show_enhanced_image">显示超分图</string>
+    <string name="reader_enable_image_enhancement_to_compare">请先开启图像增强</string>
+    <string name="reader_retry_npu">重试 NPU</string>
     <string name="reader_spatial_scene">空间图像</string>
     <string name="reader_spatial_scene_loading">正在生成空间图像…</string>
     <string name="reader_spatial_scene_runtime_unavailable">空间图像需要 Android 12 及支持的骁龙 HTP</string>

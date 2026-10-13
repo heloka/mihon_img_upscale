@@ -17,6 +17,39 @@ class ReaderPreferences(
         if (selectedModel in REMOVED_ENHANCEMENT_MODELS || selectedModel >= FIRST_CUSTOM_MODEL_ID) {
             model.set(8)
         }
+
+        // One-shot migration to the tuned defaults for this build. Runs once per
+        // install so manual tweaks made afterwards are preserved.
+        val defaultsRevision = preferenceStore.getBoolean("pref_realcugan_defaults_v8", false)
+        if (!defaultsRevision.get()) {
+            preferenceStore.getInt("pref_realcugan_processing_backend").set(REAL_CUGAN_DEFAULT_PROCESSING_BACKEND)
+            preferenceStore.getInt("pref_realcugan_tile_size").set(REAL_CUGAN_DEFAULT_TILE_SIZE)
+            preferenceStore.getInt("pref_realcugan_preload_size").set(REAL_CUGAN_DEFAULT_PRELOAD_SIZE)
+            preferenceStore.getInt("pref_realcugan_precision").set(REAL_CUGAN_DEFAULT_PRECISION)
+            preferenceStore.getInt("pref_realcugan_max_size_width").set(REAL_CUGAN_DEFAULT_MAX_SIZE)
+            preferenceStore.getInt("pref_realcugan_max_size_height").set(REAL_CUGAN_DEFAULT_MAX_SIZE)
+            defaultsRevision.set(true)
+        }
+
+        // One-shot: restore the SE-only NPU setup this fork was built for
+        // (later sessions had switched the backend back to Vulkan).
+        val npuRestoreRevision = preferenceStore.getBoolean("pref_realcugan_defaults_v9_npu", false)
+        if (!npuRestoreRevision.get()) {
+            // Qualcomm NPU (SE-only; the whitelist gates anything unsupported).
+            preferenceStore.getInt("pref_realcugan_processing_backend").set(1)
+            preferenceStore.getInt("pref_realcugan_model").set(0)
+            preferenceStore.getInt("pref_realcugan_scale").set(2)
+            npuRestoreRevision.set(true)
+        }
+
+        // One-shot: default the NPU to the W8A16 (8-bit weights) libraries.
+        // Halves weight bandwidth on the HTP; the Vulkan fallback still runs
+        // FP16 regardless of this setting.
+        val int8Revision = preferenceStore.getBoolean("pref_realcugan_defaults_v10_int8", false)
+        if (!int8Revision.get()) {
+            preferenceStore.getInt("pref_realcugan_precision").set(2)
+            int8Revision.set(true)
+        }
     }
 
     // region General
@@ -105,23 +138,23 @@ class ReaderPreferences(
 
     fun realEsrganStyle() = preferenceStore.getInt("pref_realesrgan_style", 0) // 0: Anime, 1: Photo
 
-    fun realCuganPreloadSize() = preferenceStore.getInt("pref_realcugan_preload_size", 3)
+    fun realCuganPreloadSize() = preferenceStore.getInt("pref_realcugan_preload_size", REAL_CUGAN_DEFAULT_PRELOAD_SIZE)
 
     fun realCuganProEnabled() = preferenceStore.getBoolean("pref_realcugan_pro_enabled", false)
 
     fun realCuganPerformanceMode() = preferenceStore.getInt("pref_realcugan_performance_mode", 0) // 0: 90%, 1: 50%, 2: 30%
 
-    fun realCuganTileSize() = preferenceStore.getInt("pref_realcugan_tile_size", 128)
+    fun realCuganTileSize() = preferenceStore.getInt("pref_realcugan_tile_size", REAL_CUGAN_DEFAULT_TILE_SIZE)
 
     fun realCuganPrecision() = preferenceStore.getInt("pref_realcugan_precision", 0) // 0: FP16, 1: FP32, 2: INT8, 3: BF16
 
-    fun realCuganProcessingBackend() = preferenceStore.getInt("pref_realcugan_processing_backend", 1) // 0: Vulkan, 1: Qualcomm NPU
+    fun realCuganProcessingBackend() = preferenceStore.getInt("pref_realcugan_processing_backend", REAL_CUGAN_DEFAULT_PROCESSING_BACKEND) // 0: Vulkan, 1: Qualcomm NPU
 
     fun realCuganFp16Arithmetic() = preferenceStore.getBoolean("pref_realcugan_fp16_arithmetic", false)
 
-    fun realCuganMaxSizeWidth() = preferenceStore.getInt("pref_realcugan_max_size_width", 1600)
+    fun realCuganMaxSizeWidth() = preferenceStore.getInt("pref_realcugan_max_size_width", REAL_CUGAN_DEFAULT_MAX_SIZE)
 
-    fun realCuganMaxSizeHeight() = preferenceStore.getInt("pref_realcugan_max_size_height", 1600)
+    fun realCuganMaxSizeHeight() = preferenceStore.getInt("pref_realcugan_max_size_height", REAL_CUGAN_DEFAULT_MAX_SIZE)
 
     fun realCuganSkipMaxSizeWidth() = preferenceStore.getInt("pref_realcugan_skip_max_size_width", 0)
 
@@ -236,6 +269,14 @@ class ReaderPreferences(
     companion object {
         private const val FIRST_CUSTOM_MODEL_ID = 1000
         private val REMOVED_ENHANCEMENT_MODELS = setOf(7, 10, 11, 12, 13, 14, 15, 17)
+
+        // The requested HTP target is discovered from QNN at runtime and must
+        // match a packaged manifest entry; unsupported combinations use Vulkan.
+        const val REAL_CUGAN_DEFAULT_PROCESSING_BACKEND = 0
+        const val REAL_CUGAN_DEFAULT_TILE_SIZE = 256
+        const val REAL_CUGAN_DEFAULT_PRELOAD_SIZE = 8
+        const val REAL_CUGAN_DEFAULT_PRECISION = 0
+        const val REAL_CUGAN_DEFAULT_MAX_SIZE = 1280
 
         const val WEBTOON_PADDING_MIN = 0
         const val WEBTOON_PADDING_MAX = 25

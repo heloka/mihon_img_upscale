@@ -1,6 +1,7 @@
 #include "anime4k.h"
 #include "periodic_texture_guard.h"
 #include "qnn_backend.h"
+#include "spatial_qnn_runtime.h"
 #include "waifu2x.h"
 #include <android/bitmap.h>
 #include <android/log.h>
@@ -9,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <jni.h>
 #include <mutex>
 #include <vector>
@@ -25,6 +27,9 @@ static Anime4K *g_anime4k = nullptr;
 static std::mutex g_lock;
 static std::atomic<int> g_progress{0};
 static std::atomic<int> g_current_id{-1};
+// 0=none, 1=QNN/HTP, 2=Vulkan, 3=staged NCNN. Keep execution provenance
+// separate from QNN initialization so successful GPU fallback is not misreported.
+static std::atomic<int> g_last_inference_backend{0};
 static std::atomic<int> g_ui_busy{0};
 static std::atomic<bool> g_abort_processing{false};
 static bool g_realcugan_denoise3 = false;
@@ -162,8 +167,8 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeIsQnnRuntimeAvailable(
   return qnn_backend::is_runtime_loadable() ? JNI_TRUE : JNI_FALSE;
 }
 
-extern "C" JNIEXPORT jint JNICALL
-Java_eu_kanade_tachiyomi_util_qnn_QualcommHtp_nativeArchitecture(
+extern "C" JNIEXPORT jintArray JNICALL
+Java_eu_kanade_tachiyomi_util_qnn_QualcommHtp_nativePlatformInfo(
     JNIEnv *env, jobject, jstring native_library_dir) {
   const char *library_dir_chars =
       env->GetStringUTFChars(native_library_dir, nullptr);
@@ -174,13 +179,20 @@ Java_eu_kanade_tachiyomi_util_qnn_QualcommHtp_nativeArchitecture(
     setenv("ADSP_LIBRARY_PATH", dsp_paths.c_str(), 1);
   }
   env->ReleaseStringUTFChars(native_library_dir, library_dir_chars);
-  return static_cast<jint>(qnn_backend::architecture());
+  const auto platform = qnn_backend::platform_info();
+  const jint values[] = {static_cast<jint>(platform[0]),
+                         static_cast<jint>(platform[1])};
+  jintArray result = env->NewIntArray(2);
+  if (result) {
+    env->SetIntArrayRegion(result, 0, 2, values);
+  }
+  return result;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitQnn(
     JNIEnv *env, jobject, jstring context_path, jstring native_library_dir,
-    jint padding) {
+    jint padding, jboolean input_bgr) {
   std::lock_guard<std::mutex> lock(g_lock);
   const char *context_path_chars = env->GetStringUTFChars(context_path, nullptr);
   const char *library_dir_chars =
@@ -190,10 +202,75 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitQnn(
       ";/vendor/dsp/cdsp;/vendor/lib/rfsa/cdsp;/system/vendor/lib/rfsa/cdsp";
   setenv("ADSP_LIBRARY_PATH", dsp_paths.c_str(), 1);
   LOGD("QNN ADSP_LIBRARY_PATH=%s", dsp_paths.c_str());
-  const bool initialized =
-      qnn_backend::initialize(context_path_chars, static_cast<int>(padding));
+
+  std::string effective_context = context_path_chars;
   env->ReleaseStringUTFChars(native_library_dir, library_dir_chars);
   env->ReleaseStringUTFChars(context_path, context_path_chars);
+
+  // A `.model.so` input is an ONNX-converted QNN model library: compose,
+  // finalize and serialize it in this process (the shell user has no DSP
+  // access, so the standalone generator cannot be used), then load the result.
+  // This remains a synchronous native call. The caller is an IO worker, but a
+  // DSP-side hang cannot safely be cancelled from this process.
+  const std::string model_suffix = ".model.so";
+  if (effective_context.size() > model_suffix.size() &&
+      effective_context.compare(effective_context.size() - model_suffix.size(),
+                                model_suffix.size(), model_suffix) == 0) {
+    // Keep generated contexts separate from a packaged older .bin with the
+    // same stem; these model libraries are authoritative for the new QNN path.
+    const std::string compiled = effective_context + ".context.bin";
+    std::ifstream existing(compiled, std::ios::binary | std::ios::ate);
+    const bool has_cached_context = existing && existing.tellg() > 0;
+    existing.close();
+    bool ready = false;
+    if (has_cached_context) {
+      ready = qnn_backend::initialize(compiled, padding, input_bgr == JNI_TRUE);
+      if (!ready) {
+        LOGE("Cached QNN context is damaged or incompatible; rebuilding: %s",
+             compiled.c_str());
+        std::remove(compiled.c_str());
+        std::remove((compiled + ".partial").c_str());
+      }
+    }
+    if (!ready) {
+      ready = qnn_backend::build_from_model_lib(
+          effective_context, compiled, static_cast<int>(padding),
+          input_bgr == JNI_TRUE);
+    }
+    if (!ready) {
+      LOGE("QNN on-device model library build failed");
+      return JNI_FALSE;
+    }
+    effective_context = compiled;
+  }
+
+  // QAIRT 2.5x converters emit a DLC (PK zip container) that carries the
+  // HTP offline cache for the target SoC. Compile it into a native context
+  // binary on-device once, then hand the result to the standard loader.
+  {
+    std::ifstream magic_stream(effective_context, std::ios::binary);
+    char magic[2] = {0, 0};
+    magic_stream.read(magic, 2);
+    magic_stream.close();
+    if (magic[0] == 'P' && magic[1] == 'K') {
+      const std::string compiled = effective_context + ".compiled";
+      std::ifstream existing(compiled, std::ios::binary | std::ios::ate);
+      if (!existing || existing.tellg() <= 0) {
+        existing.close();
+        spatial_qnn::Runtime dlc_runtime;
+        if (!dlc_runtime.compile_dlc(effective_context, compiled)) {
+          LOGE("QNN on-device DLC compilation failed: %s",
+               dlc_runtime.error().c_str());
+          return JNI_FALSE;
+        }
+        LOGD("QNN compiled DLC to native context: %s", compiled.c_str());
+      }
+      effective_context = compiled;
+    }
+  }
+
+  const bool initialized = qnn_backend::initialize(
+      effective_context, static_cast<int>(padding), input_bgr == JNI_TRUE);
   return initialized ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -320,6 +397,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
                                                             jobject thiz,
                                                             jobject bitmap,
                                                             jint id) {
+  g_last_inference_backend.store(0);
   int ret = -1;
   jobject outBitmap = nullptr;
 
@@ -424,6 +502,9 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
             LOGD("QNN HTP processing %s in %lld ms",
                  ret == 0 ? "completed" : "failed",
                  static_cast<long long>(qnn_ms));
+            if (ret == 0) {
+              g_last_inference_backend.store(1);
+            }
           }
 
           if (ret != 0 && !g_abort_processing.load() &&
@@ -439,6 +520,9 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
             LOGD("Fused Vulkan processing %s in %lld ms",
                  ret == 0 ? "completed" : "failed",
                  static_cast<long long>(fused_ms));
+            if (ret == 0) {
+              g_last_inference_backend.store(2);
+            }
           }
 
           if (ret != 0 && !g_abort_processing.load()) {
@@ -455,6 +539,9 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
             LOGD("Staged processing %s in %lld ms",
                  ret == 0 ? "completed" : "failed",
                  static_cast<long long>(staged_ms));
+            if (ret == 0) {
+              g_last_inference_backend.store(3);
+            }
           }
 
           if (ret == 0 && is_monochrome_input) {
@@ -479,6 +566,103 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
   }
 
   return outBitmap;
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcessQnnOnly(
+    JNIEnv *env, jobject thiz, jobject bitmap, jint id, jint expected_scale) {
+  if (!bitmap) return nullptr;
+
+  std::lock_guard<std::mutex> lock(g_lock);
+  if (!qnn_backend::is_initialized()) {
+    LOGE("QNN-only inference requested without an initialized HTP graph");
+    return nullptr;
+  }
+
+  AndroidBitmapInfo input_info{};
+  if (AndroidBitmap_getInfo(env, bitmap, &input_info) < 0 ||
+      input_info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+    LOGE("QNN-only inference requires an RGBA_8888 input bitmap");
+    return nullptr;
+  }
+  const int scale = qnn_backend::output_scale();
+  if (scale <= 0 || scale != expected_scale) {
+    LOGE("QNN-only output scale mismatch: graph=%d requested=%d", scale,
+         expected_scale);
+    return nullptr;
+  }
+
+  jclass bitmap_class = env->FindClass("android/graphics/Bitmap");
+  jmethodID create_bitmap = env->GetStaticMethodID(
+      bitmap_class, "createBitmap",
+      "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;");
+  jclass config_class = env->FindClass("android/graphics/Bitmap$Config");
+  jfieldID config_field =
+      env->GetStaticFieldID(config_class, "ARGB_8888",
+                            "Landroid/graphics/Bitmap$Config;");
+  jobject config = env->GetStaticObjectField(config_class, config_field);
+  jobject output_bitmap = env->CallStaticObjectMethod(
+      bitmap_class, create_bitmap, input_info.width * scale,
+      input_info.height * scale, config);
+  if (!output_bitmap || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+
+  AndroidBitmapInfo output_info{};
+  if (AndroidBitmap_getInfo(env, output_bitmap, &output_info) < 0 ||
+      output_info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+    return nullptr;
+  }
+  void *input_pixels = nullptr;
+  if (AndroidBitmap_lockPixels(env, bitmap, &input_pixels) < 0) {
+    return nullptr;
+  }
+  const size_t packed_stride = static_cast<size_t>(input_info.width) * 4u;
+  std::vector<uint8_t> packed_input(packed_stride * input_info.height);
+  for (int y = 0; y < static_cast<int>(input_info.height); ++y) {
+    memcpy(packed_input.data() + static_cast<size_t>(y) * packed_stride,
+           static_cast<const uint8_t *>(input_pixels) +
+               static_cast<size_t>(y) * input_info.stride,
+           packed_stride);
+  }
+  AndroidBitmap_unlockPixels(env, bitmap);
+  const bool monochrome = normalize_monochrome_input(
+      packed_input.data(), input_info.width, input_info.height);
+
+  void *output_pixels = nullptr;
+  if (AndroidBitmap_lockPixels(env, output_bitmap, &output_pixels) < 0) {
+    return nullptr;
+  }
+
+  g_abort_processing.store(false);
+  g_current_id.store(id);
+  g_progress.store(0);
+  g_last_inference_backend.store(0);
+  const auto start = std::chrono::steady_clock::now();
+  const int result = qnn_backend::process_rgba(
+      packed_input.data(), input_info.width, input_info.height,
+      static_cast<int>(packed_stride),
+      static_cast<uint8_t *>(output_pixels), output_info.stride, &g_progress,
+      &g_abort_processing);
+  if (result == 0 && monochrome) {
+    force_monochrome_output(static_cast<unsigned char *>(output_pixels),
+                            output_info.width, output_info.height,
+                            output_info.stride);
+  }
+  AndroidBitmap_unlockPixels(env, output_bitmap);
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count();
+  if (result != 0) {
+    LOGE("Isolated QNN inference failed or was aborted (status=%d) after %lld ms",
+         result, static_cast<long long>(elapsed_ms));
+    return nullptr;
+  }
+  g_last_inference_backend.store(1);
+  LOGD("Isolated QNN inference completed in %lld ms",
+       static_cast<long long>(elapsed_ms));
+  return output_bitmap;
 }
 
 extern "C" JNIEXPORT jobject JNICALL
@@ -896,6 +1080,13 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeGetProgress(JNIEnv *env,
   jlong progress = (jlong)g_progress.load();
   return (id << 32) | (progress & 0xFFFFFFFF);
 }
+
+extern "C" JNIEXPORT jint JNICALL
+Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeLastInferenceBackend(
+    JNIEnv *env, jobject thiz) {
+  return g_last_inference_backend.load();
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeSetUiBusy(JNIEnv *env,
                                                               jobject thiz,

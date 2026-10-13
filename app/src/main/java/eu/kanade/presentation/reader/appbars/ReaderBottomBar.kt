@@ -28,7 +28,8 @@ fun ReaderBottomBar(
     cropEnabled: Boolean,
     onClickCropBorder: () -> Unit,
     imageEnhancementEnabled: Boolean,
-    onClickImageEnhancement: () -> Unit,
+    compareShowsOriginal: Boolean,
+    onClickImageComparison: () -> Unit,
     spatialSceneActive: Boolean,
     spatialSceneBusy: Boolean,
     onClickSpatialScene: () -> Unit,
@@ -72,11 +73,17 @@ fun ReaderBottomBar(
             )
         }
 
-        IconButton(onClick = onClickImageEnhancement) {
+        IconButton(onClick = onClickImageComparison) {
             Icon(
                 painter = painterResource(R.drawable.ic_photo_24dp),
-                contentDescription = stringResource(MR.strings.reader_image_enhancement),
-                tint = if (imageEnhancementEnabled) iconTint else inactiveTint,
+                contentDescription = stringResource(
+                    when {
+                        !imageEnhancementEnabled -> MR.strings.reader_enable_image_enhancement_to_compare
+                        compareShowsOriginal -> MR.strings.reader_show_enhanced_image
+                        else -> MR.strings.reader_show_original_image
+                    },
+                ),
+                tint = if (imageEnhancementEnabled && compareShowsOriginal) iconTint else inactiveTint,
             )
         }
 

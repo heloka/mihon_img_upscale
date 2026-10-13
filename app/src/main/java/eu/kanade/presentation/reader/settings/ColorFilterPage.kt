@@ -155,7 +155,9 @@ internal fun ColumnScope.ColorFilterPage(screenModel: ReaderSettingsScreenModel)
         val realCuganNoiseLevel by screenModel.preferences.realCuganNoiseLevel().collectAsState()
         val realCuganScale by screenModel.preferences.realCuganScale().collectAsState()
         val processingBackend by screenModel.preferences.realCuganProcessingBackend().collectAsState()
-        val npuDeviceAvailable = remember { Waifu2x.isQualcommNpuAvailable() }
+        val npuDeviceAvailable = remember {
+            !Waifu2x.QUALCOMM_NPU_TEMPORARILY_DISABLED && Waifu2x.isQualcommNpuAvailable()
+        }
         val useQualcommNpu = processingBackend == Waifu2x.PROCESSING_BACKEND_QUALCOMM_NPU && npuDeviceAvailable
 
         LaunchedEffect(npuDeviceAvailable, processingBackend) {
@@ -196,14 +198,16 @@ internal fun ColumnScope.ColorFilterPage(screenModel: ReaderSettingsScreenModel)
                 },
                 label = { Text(stringResource(MR.strings.reader_backend_vulkan)) },
             )
-            FilterChip(
-                selected = useQualcommNpu,
-                onClick = {
-                    screenModel.preferences.realCuganProcessingBackend().set(Waifu2x.PROCESSING_BACKEND_QUALCOMM_NPU)
-                },
-                enabled = npuDeviceAvailable,
-                label = { Text(stringResource(MR.strings.reader_backend_qualcomm_npu)) },
-            )
+            if (!Waifu2x.QUALCOMM_NPU_TEMPORARILY_DISABLED) {
+                FilterChip(
+                    selected = useQualcommNpu,
+                    onClick = {
+                        screenModel.preferences.realCuganProcessingBackend().set(Waifu2x.PROCESSING_BACKEND_QUALCOMM_NPU)
+                    },
+                    enabled = npuDeviceAvailable,
+                    label = { Text(stringResource(MR.strings.reader_backend_qualcomm_npu)) },
+                )
+            }
         }
 
         SettingsChipRow(stringResource(MR.strings.reader_model)) {
@@ -340,7 +344,7 @@ internal fun ColumnScope.ColorFilterPage(screenModel: ReaderSettingsScreenModel)
         }
 
         SettingsChipRow(stringResource(MR.strings.reader_preload_pages)) {
-            listOf(1, 2, 3, 5, 8).map { size ->
+            listOf(1, 2, 3, 5, 8, 16).map { size ->
                 val realCuganPreloadSize by screenModel.preferences.realCuganPreloadSize().collectAsState()
                 FilterChip(
                     selected = realCuganPreloadSize == size,
@@ -410,6 +414,16 @@ internal fun ColumnScope.ColorFilterPage(screenModel: ReaderSettingsScreenModel)
                     selected = precision == value,
                     onClick = { screenModel.preferences.realCuganPrecision().set(value) },
                     label = { Text(name) },
+                )
+            }
+        }
+
+        if (useQualcommNpu && !Waifu2x.QUALCOMM_NPU_TEMPORARILY_DISABLED) {
+            SettingsChipRow(stringResource(MR.strings.reader_backend_qualcomm_npu)) {
+                FilterChip(
+                    selected = false,
+                    onClick = { Waifu2x.retryNpu() },
+                    label = { Text(stringResource(MR.strings.reader_retry_npu)) },
                 )
             }
         }

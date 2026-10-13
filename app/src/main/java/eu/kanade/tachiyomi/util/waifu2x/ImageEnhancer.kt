@@ -15,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import tachiyomi.core.common.util.system.logcat
@@ -30,8 +31,32 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 
 object ImageEnhancer {
+    // Watchdog tuning: a request whose native progress stops advancing for
+    // WATCHDOG_STALL_MS, or that simply runs longer than WATCHDOG_TOTAL_MS, is
+    // aborted so the single worker never wedges the whole queue behind it.
+    private const val WATCHDOG_POLL_MS = 2_000L
+    private const val WATCHDOG_STALL_MS = 15_000L
+    private const val WATCHDOG_TOTAL_MS = 60_000L
+    private const val MAX_WATCHDOG_DROPS_PER_PAGE = 2
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val pendingRequests = ConcurrentHashMap<String, Int>()
+    private val watchdogDropCounts = ConcurrentHashMap<String, Int>()
+
+    @Volatile
+    private var activeRequestStartedAt = 0L
+
+    @Volatile
+    private var watchdogLastProgress = -1
+
+    @Volatile
+    private var watchdogLastProgressAt = 0L
+
+    @Volatile
+    private var watchdogDroppedCurrent = false
+
+    @Volatile
+    private var lastWarmUpKey: String? = null
     
     // Priority Queue order:
     // 1. Current visible primary page
@@ -157,6 +182,60 @@ object ImageEnhancer {
             }
         }
 
+        // Watchdog Loop: unblocks the worker when a request stops making
+        // measurable progress (wedged decode/network path, or native stall).
+        scope.launch {
+            while (true) {
+                delay(WATCHDOG_POLL_MS)
+                try {
+                    val req = activeRequest ?: continue
+                    val startedAt = activeRequestStartedAt
+                    if (startedAt == 0L) continue
+                    val now = System.currentTimeMillis()
+
+                    val packed = try {
+                        Waifu2x.getProgress()
+                    } catch (_: Throwable) {
+                        -1L
+                    }
+                    val nativeId = if (packed >= 0) (packed shr 32).toInt() else -1
+                    val nativePercent = if (packed >= 0) (packed and 0xFFFFFFFFL).toInt() else -1
+
+                    if (nativeId == req.pageIndex && nativePercent >= 0 && nativePercent != watchdogLastProgress) {
+                        watchdogLastProgress = nativePercent
+                        watchdogLastProgressAt = now
+                    }
+
+                    val lastActivity = maxOf(startedAt, watchdogLastProgressAt)
+                    val stalled = now - lastActivity >= WATCHDOG_STALL_MS
+                    val overdue = now - startedAt >= WATCHDOG_TOTAL_MS
+                    if ((stalled || overdue) && !watchdogDroppedCurrent) {
+                        watchdogDroppedCurrent = true
+                        val key = requestKey(req.mangaId, req.chapterId, req.pageIndex, req.pageVariant)
+                        watchdogDropCounts[key] = (watchdogDropCounts[key] ?: 0) + 1
+                        logcat(LogPriority.WARN) {
+                            "ImageEnhancer: Watchdog aborting page ${req.pageIndex}/${req.pageVariant} " +
+                                "(stalled=${stalled}, overdue=${overdue}, " +
+                                "nativeProgress=$nativeId/$nativePercent, dropCount=${watchdogDropCounts[key]})"
+                        }
+                        try {
+                            Waifu2x.abortProcessing()
+                        } catch (t: Throwable) {
+                            logcat(LogPriority.WARN, t) { "ImageEnhancer: Watchdog failed to signal native abort" }
+                        }
+                        activeJob?.cancel(
+                            CancellationException(
+                                "Image enhancement watchdog timeout (page ${req.pageIndex}/${req.pageVariant})",
+                            ),
+                        )
+                    }
+                } catch (e: Exception) {
+                    if (e !is CancellationException) {
+                        logcat(LogPriority.ERROR, e) { "ImageEnhancer: Watchdog loop error" }
+                    }
+                }
+            }
+        }
     }
 
     fun enhance(context: Context, page: ReaderPage, highPriority: Boolean = false) {
@@ -203,9 +282,15 @@ object ImageEnhancer {
         }
         if (ImageEnhancementCache.isSavePending(mangaId, chapterId, pageIndex, pageVariant)) return
 
+        val requestKey = requestKey(mangaId, chapterId, pageIndex, pageVariant)
+        if ((watchdogDropCounts[requestKey] ?: 0) >= MAX_WATCHDOG_DROPS_PER_PAGE) {
+            // This page repeatedly stalled the worker; leave it as a raw image
+            // instead of letting it starve the rest of the queue again.
+            return
+        }
+
         val isInitialTargetRequest = !initialTargetEnqueued && pageIndex == targetPageIndex
         val effectiveHighPriority = highPriority || isInitialTargetRequest
-        val requestKey = requestKey(mangaId, chapterId, pageIndex, pageVariant)
         val requestGeneration = generation.get()
         
         val existingGeneration = pendingRequests[requestKey]
@@ -289,6 +374,109 @@ object ImageEnhancer {
         logcat(LogPriority.DEBUG) { "ImageEnhancer: Resetting state to page $initialPageIndex" }
     }
 
+    /**
+     * Prepare the native upscaler before the first page needs it: extract model
+     * assets, initialize the model for the current settings, and run one tiny
+     * inference so all GPU pipelines are compiled ahead of real work. Called when
+     * the reader opens; the first page then skips the multi-second cold start.
+     */
+    fun warmUp(context: Context) {
+        val appContext = context.applicationContext
+        if (!preferences.realCuganEnabled().get()) return
+        initializeRuntime(appContext)
+
+        val warmUpKey = "${currentConfigHash()}:model${preferences.realCuganModel().get()}"
+        if (lastWarmUpKey == warmUpKey) return
+        lastWarmUpKey = warmUpKey
+
+        scope.launch {
+            try {
+                // A concurrent cancelAll() may still be tearing down the previous
+                // native model; wait it out so warm-up is not immediately undone.
+                nativeResetJob?.let { job ->
+                    runCatching { job.join() }
+                }
+                val model = preferences.realCuganModel().get()
+                val initialized = initModelForCurrentConfig(appContext, model)
+                if (!initialized) {
+                    logcat(LogPriority.WARN) { "ImageEnhancer: Warm-up could not initialize model $model" }
+                    return@launch
+                }
+                val warmed = runWarmUpInference(model)
+                logcat(LogPriority.DEBUG) {
+                    "ImageEnhancer: Warm-up complete for model $model (inference=${if (warmed) "ok" else "skipped"})"
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logcat(LogPriority.WARN, e) { "ImageEnhancer: Warm-up failed" }
+            }
+        }
+    }
+
+    private fun initModelForCurrentConfig(context: Context, model: Int): Boolean {
+        val noise = preferences.realCuganNoiseLevel().get()
+        val scale = ImageEnhancementCache.getEffectiveScale(
+            model,
+            preferences.realCuganScale().get(),
+            preferences.realEsrganStyle().get(),
+        )
+        val tileSleepMs = when (preferences.realCuganPerformanceMode().get()) {
+            1 -> 5
+            2 -> 15
+            else -> 0
+        }
+        val tileSize = preferences.realCuganTileSize().get().coerceAtLeast(32)
+        val precision = preferences.realCuganPrecision().get()
+        // INT8 is an NPU-only selection: the ncnn fallback always runs FP16 so a
+        // QNN failure lands on the fast Vulkan pipeline instead of the slow
+        // int8 CPU path.
+        val requestedBackend = preferences.realCuganProcessingBackend().get()
+        val processingBackend = Waifu2x.resolveProcessingBackend(
+            requestedBackend,
+            model,
+            scale,
+        )
+        val ncnnPrecision = Waifu2x.resolveVulkanFallbackPrecision(precision, requestedBackend, model, scale)
+        val fp16Arithmetic = Waifu2x.resolveVulkanFallbackFp16Arithmetic(
+            preferences.realCuganFp16Arithmetic().get(),
+            requestedBackend,
+            model,
+            scale,
+        )
+        return when (model) {
+            0 -> Waifu2x.initRealCugan(context, noise, scale, isPro = false, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend, npuPrecision = precision)
+            1 -> Waifu2x.initRealCugan(context, noise, scale, isPro = true, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend, npuPrecision = precision)
+            Waifu2x.MODEL_REAL_ESRGAN_ANIME -> Waifu2x.initRealESRGAN(context, scale, style = preferences.realEsrganStyle().get(), tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend, npuPrecision = precision)
+            3 -> Waifu2x.initNose(context, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic)
+            4 -> Waifu2x.initWaifu2x(context, noise, scale, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic)
+            5 -> Waifu2x.initWaifu2xUpconv7(context, noise, scale, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic)
+            else -> if (Waifu2x.isW2xExModel(model)) {
+                Waifu2x.initW2xEx(context, model, scale = scale, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend, npuPrecision = precision)
+            } else {
+                Waifu2x.initRealCugan(context, noise, scale, isPro = false, tileSleepMs = tileSleepMs, tileSize = tileSize, precision = ncnnPrecision, fp16Arithmetic = fp16Arithmetic, processingBackend = processingBackend, npuPrecision = precision)
+            }
+        }
+    }
+
+    private fun runWarmUpInference(model: Int): Boolean {
+        val dummy = android.graphics.Bitmap.createBitmap(64, 64, android.graphics.Bitmap.Config.ARGB_8888)
+        return try {
+            dummy.eraseColor(0xFF808080.toInt())
+            val result = when (model) {
+                0, 1 -> Waifu2x.processRealCugan(dummy, -1)
+                Waifu2x.MODEL_REAL_ESRGAN_ANIME -> Waifu2x.processRealESRGAN(dummy, -1)
+                3 -> Waifu2x.processNose(dummy, -1)
+                4, 5 -> Waifu2x.processWaifu2x(dummy, -1)
+                else -> if (Waifu2x.isW2xExModel(model)) Waifu2x.processW2xEx(dummy, -1) else Waifu2x.processRealCugan(dummy, -1)
+            }
+            result?.recycle()
+            result != null
+        } finally {
+            dummy.recycle()
+        }
+    }
+
     fun cancelAll(reason: String = "cancelAll", resetNative: Boolean = true) {
         generation.incrementAndGet()
         queue.clear()
@@ -297,6 +485,14 @@ object ImageEnhancer {
         activeRequest?.cancelled?.set(true)
         activeJob = null
         activeRequest = null
+        activeRequestStartedAt = 0L
+        watchdogLastProgress = -1
+        watchdogLastProgressAt = 0L
+        watchdogDroppedCurrent = false
+        watchdogDropCounts.clear()
+        // cancelAll tears down the native model; the next reader session must
+        // warm it up again.
+        lastWarmUpKey = null
         activeMangaId = -1L
         activeChapterId = -1L
         activePageIndex = -1
@@ -412,6 +608,10 @@ object ImageEnhancer {
             activePageIndex = req.pageIndex
             activePageVariant = req.pageVariant
             activeRequest = req
+            activeRequestStartedAt = System.currentTimeMillis()
+            watchdogLastProgress = -1
+            watchdogLastProgressAt = 0L
+            watchdogDroppedCurrent = false
             logcat(LogPriority.DEBUG) { "ImageEnhancer: Processing page ${req.pageIndex}/${req.pageVariant} (priority=${req.priority})" }
             val data = req.dataProvider() ?: return
             if (req.generation != generation.get() || req.cancelled.get()) return
@@ -444,6 +644,10 @@ object ImageEnhancer {
             activePageVariant = ""
             activeJob = null
             activeRequest = null
+            activeRequestStartedAt = 0L
+            watchdogLastProgress = -1
+            watchdogLastProgressAt = 0L
+            watchdogDroppedCurrent = false
             pendingRequests.remove(req.key, req.generation)
 
             if (shouldRequeue) {
@@ -486,6 +690,14 @@ object ImageEnhancer {
         scope.launch {
             ImageEnhancementCache.checkAndTrim(context)
             updatePerformanceSettings()
+        }
+        // Keep the enhanced-image cache trimmed during long reading sessions
+        // instead of only checking once per process.
+        scope.launch {
+            while (true) {
+                delay(10 * 60 * 1000)
+                ImageEnhancementCache.checkAndTrim(context)
+            }
         }
         scope.launch {
             preferences.realCuganPerformanceMode().changes().collect {
