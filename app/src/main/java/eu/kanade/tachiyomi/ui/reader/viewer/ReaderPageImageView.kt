@@ -285,7 +285,8 @@ open class ReaderPageImageView @JvmOverloads constructor(
 
 
     private fun recycleEnhancedBitmap() {
-        if (!enhancedBitmapShared) recycleEnhancedBitmap()
+        if (!enhancedBitmapShared) enhancedBitmap?.recycle()
+        enhancedBitmap = null
         enhancedBitmapShared = false
     }
     private fun decodeEnhancedBitmap(file: java.io.File, ringKey: String? = null): Bitmap? {
