@@ -13,6 +13,7 @@ import android.util.AttributeSet
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -211,17 +212,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
     private fun updateStatus(text: String?) {
         lastStatusText = text
         post {
-            if (suppressDefaultStatus) {
-                statusView.isVisible = false
-                return@post
-            }
-            if (!realCuganShowStatus || text == null) {
-                statusView.isVisible = false
-                return@post
-            }
-            statusView.text = text
-            statusView.isVisible = true
-            statusView.bringToFront()
+            statusView.showStatusLabel(text.takeUnless { suppressDefaultStatus || !realCuganShowStatus })
         }
     }
 
@@ -401,7 +392,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
         originalComparisonView?.isVisible = showOriginalComparison
         pageView = if (showOriginalComparison) originalComparisonView ?: swapView else swapView
         pageView?.bringToFront()
-        statusView.bringToFront()
+        statusView.bringToFrontIfNeeded()
         processedSwapView = null
         outgoingProcessedView = null
 
@@ -432,7 +423,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
         target.isVisible = true
         target.bringToFront()
         pageView = target
-        statusView.bringToFront()
+        statusView.bringToFrontIfNeeded()
     }
 
     private fun displayedImageRect(view: SubsamplingScaleImageView): RectF? {
@@ -515,7 +506,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
                         }
 
                         bringToFront()
-                        statusView.bringToFront()
+                        statusView.bringToFrontIfNeeded()
                         pageView = this@apply
                         val revealStart = processedTransitionStartFraction.coerceIn(0f, 1f)
                         val revealEnd = processedTransitionEndFraction.coerceIn(revealStart, 1f)
@@ -588,7 +579,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
                     enhancedOverlay.setImageBitmap(previewBitmap)
                     enhancedOverlay.alpha = 1f
                     enhancedOverlay.isVisible = true
-                    statusView.bringToFront()
+                    statusView.bringToFrontIfNeeded()
                     enhancedBitmap = previewBitmap
                     enhancedBitmapShared = false
                     isSettingProcessedImage = true
@@ -628,7 +619,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
             enhancedOverlay.setImageBitmap(bitmap)
             enhancedOverlay.alpha = 1f
             enhancedOverlay.isVisible = true
-            statusView.bringToFront()
+            statusView.bringToFrontIfNeeded()
             enhancedBitmap = bitmap
             enhancedBitmapShared = true
             isSettingProcessedImage = true
@@ -1440,3 +1431,21 @@ object EnhancementComparison {
 
 private const val MAX_ZOOM_SCALE = 5F
 private const val PROCESSED_SWAP_DURATION_MS = 280L
+
+/**
+ * Shows [label] on a page status overlay, or hides it for null/empty, without touching the
+ * view tree when nothing changed. setText and bringToFront each request a full layout pass and
+ * every preloaded page polls its status, so unconditional updates kept the reader redrawing
+ * continuously, and each of those frames stalled behind GPU upscaling.
+ */
+internal fun TextView.showStatusLabel(label: String?) {
+    val visible = !label.isNullOrEmpty()
+    if (visible && text.toString() != label) text = label
+    isVisible = visible
+    if (visible) bringToFrontIfNeeded()
+}
+
+internal fun View.bringToFrontIfNeeded() {
+    val parent = parent as? ViewGroup ?: return
+    if (parent.getChildAt(parent.childCount - 1) !== this) bringToFront()
+}
