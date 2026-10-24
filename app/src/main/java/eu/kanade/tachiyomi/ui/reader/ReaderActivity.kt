@@ -170,6 +170,11 @@ class ReaderActivity : BaseActivity() {
 
     private var uiBusyJob: kotlinx.coroutines.Job? = null
 
+    // False while the reader is leaving or behind another window. Inference is
+    // kept paused then so it does not starve the system's GPU-bound animations
+    // (e.g. the swipe-home transition, whose touches never reach this activity).
+    private var isReaderInForeground = true
+
     private val spatialPipeline by lazy { DepthSpatialPipeline(applicationContext) }
     private val spatialModel by lazy { DepthSpatialModel(applicationContext) }
     private var spatialSceneView: SpatialSceneView? = null
@@ -489,6 +494,7 @@ class ReaderActivity : BaseActivity() {
     }
 
     override fun onPause() {
+        setReaderInForeground(false)
         spatialSceneView?.stopMotion()
         persistCurrentPagerPage()
         lifecycleScope.launchNonCancellable {
@@ -514,6 +520,18 @@ class ReaderActivity : BaseActivity() {
         setMenuVisibility(viewModel.state.value.menuVisible)
     }
 
+    private fun setReaderInForeground(foreground: Boolean) {
+        if (isReaderInForeground == foreground) return
+        isReaderInForeground = foreground
+        if (foreground) {
+            // Hold inference for the cooldown so the return animation stays smooth too.
+            onUiInteracted()
+        } else {
+            uiBusyJob?.cancel()
+            Waifu2x.setUiBusy(true)
+        }
+    }
+
     /**
      * Called when the window focus changes. It sets the menu visibility to the last known state
      * to apply immersive mode again if needed.
@@ -522,6 +540,12 @@ class ReaderActivity : BaseActivity() {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
             setMenuVisibility(viewModel.state.value.menuVisible)
+            setReaderInForeground(true)
+        } else if (!isInMultiWindowMode) {
+            // Focus leaves as soon as a system gesture (swipe home / recents) starts, well
+            // before onPause, so GPU inference can yield before the transition animation
+            // begins. In multi-window the reader stays visible, so it keeps enhancing there.
+            setReaderInForeground(false)
         }
     }
 
@@ -589,7 +613,7 @@ class ReaderActivity : BaseActivity() {
         uiBusyJob?.cancel()
         uiBusyJob = lifecycleScope.launch {
             delay(UI_BUSY_COOLDOWN_MS)
-            if (!viewModel.state.value.menuVisible) {
+            if (!viewModel.state.value.menuVisible && isReaderInForeground) {
                 Waifu2x.setUiBusy(false)
             }
         }

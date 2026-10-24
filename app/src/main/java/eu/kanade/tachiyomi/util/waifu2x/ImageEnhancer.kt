@@ -55,6 +55,11 @@ object ImageEnhancer {
     @Volatile
     private var watchdogDroppedCurrent = false
 
+    // Time the active request spent deliberately paused for the reader UI
+    // (menu open, app in background). Not counted against WATCHDOG_TOTAL_MS.
+    @Volatile
+    private var watchdogPausedMs = 0L
+
     @Volatile
     private var lastWarmUpKey: String? = null
     
@@ -193,6 +198,14 @@ object ImageEnhancer {
                     if (startedAt == 0L) continue
                     val now = System.currentTimeMillis()
 
+                    // Native inference holds still while the UI is busy, so a
+                    // long pause is not a stall.
+                    if (Waifu2x.isUiBusy) {
+                        watchdogLastProgressAt = now
+                        watchdogPausedMs += WATCHDOG_POLL_MS
+                        continue
+                    }
+
                     val packed = try {
                         Waifu2x.getProgress()
                     } catch (_: Throwable) {
@@ -208,7 +221,7 @@ object ImageEnhancer {
 
                     val lastActivity = maxOf(startedAt, watchdogLastProgressAt)
                     val stalled = now - lastActivity >= WATCHDOG_STALL_MS
-                    val overdue = now - startedAt >= WATCHDOG_TOTAL_MS
+                    val overdue = now - startedAt - watchdogPausedMs >= WATCHDOG_TOTAL_MS
                     if ((stalled || overdue) && !watchdogDroppedCurrent) {
                         watchdogDroppedCurrent = true
                         val key = requestKey(req.mangaId, req.chapterId, req.pageIndex, req.pageVariant)
@@ -489,6 +502,7 @@ object ImageEnhancer {
         watchdogLastProgress = -1
         watchdogLastProgressAt = 0L
         watchdogDroppedCurrent = false
+        watchdogPausedMs = 0L
         watchdogDropCounts.clear()
         // cancelAll tears down the native model; the next reader session must
         // warm it up again.
@@ -612,6 +626,7 @@ object ImageEnhancer {
             watchdogLastProgress = -1
             watchdogLastProgressAt = 0L
             watchdogDroppedCurrent = false
+            watchdogPausedMs = 0L
             logcat(LogPriority.DEBUG) { "ImageEnhancer: Processing page ${req.pageIndex}/${req.pageVariant} (priority=${req.priority})" }
             val data = req.dataProvider() ?: return
             if (req.generation != generation.get() || req.cancelled.get()) return
@@ -648,6 +663,7 @@ object ImageEnhancer {
             watchdogLastProgress = -1
             watchdogLastProgressAt = 0L
             watchdogDroppedCurrent = false
+            watchdogPausedMs = 0L
             pendingRequests.remove(req.key, req.generation)
 
             if (shouldRequeue) {

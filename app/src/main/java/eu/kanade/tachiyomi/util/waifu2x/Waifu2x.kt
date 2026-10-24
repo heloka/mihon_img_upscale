@@ -975,7 +975,13 @@ object Waifu2x {
         return files.any { it.extension == "param" } && files.any { it.extension == "bin" }
     }
 
+    /** Whether native inference is currently held back for the reader UI. */
+    @Volatile
+    var isUiBusy: Boolean = false
+        private set
+
     fun setUiBusy(busy: Boolean) {
+        isUiBusy = busy
         nativeSetUiBusy(busy)
     }
 
